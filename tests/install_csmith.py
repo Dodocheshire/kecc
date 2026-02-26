@@ -40,14 +40,14 @@ def install_csmith():
         ):
             raise Exception("Unable to clone the Csmith repository")
 
-    if not execute_command("sudo apt install -y g++ cmake m4", cwd=csmith_dir):
+    if not execute_command("apt install -y g++ cmake m4", cwd=csmith_dir):
         raise Exception("Unable to install dependencies")
 
     cmake_command = f"cmake -DCMAKE_INSTALL_PREFIX=/usr/local/ ."
     if not execute_command(cmake_command, cwd=csmith_dir):
         raise Exception("Unable to run cmake.")
 
-    if not execute_command("make && sudo make install", cwd=csmith_dir):
+    if not execute_command("make && make install", cwd=csmith_dir):
         raise Exception("Unable to install.")
     return usr_bin_path, usr_inc_path
 

@@ -97,7 +97,10 @@ fn test_examples_write_c() {
         }
     });
 }
-
+#[test]
+fn test_overflow_write_c() {
+    test_write_c(Path::new("examples/c/minus_constant.c"));
+}
 #[test]
 fn test_examples_irgen_small() {
     println!("[testing irgen for \"examples/c/{HELLO_MAIN}.c\"]");
