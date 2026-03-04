@@ -1091,6 +1091,8 @@ impl Dtype {
         declarator: &ast::Declarator,
     ) -> Result<Named<Self>, DtypeError> {
         for derived_decl in &declarator.derived {
+            // 将Declarator的deriveddeclarator一层一层加到DeclarationSpecifier对应的Dtype上，构造新的Dtype(Pointer/Function/Array)
+            // 在这个例子中，self先是Dtype(const int), 随后依次应用* const, 再应用一个*const
             self = match &derived_decl.node {
                 ast::DerivedDeclarator::Pointer(pointer_qualifiers) => {
                     let mut specifier = BaseDtype::default();
@@ -1101,7 +1103,7 @@ impl Dtype {
                 }
                 ast::DerivedDeclarator::Array(array_decl) => {
                     assert!(array_decl.node.qualifiers.is_empty());
-                    self.with_ast_array_size(&array_decl.node.size)?
+                    self.with_ast_array_size(&array_decl.node.size)? // 验证数组大小ArraySize的表达式Expression可以被求值为整型常量(Constant::Int)，并且非负,返回Dtype::array(self, array_size)
                 }
                 ast::DerivedDeclarator::Function(func_decl) => {
                     let mut params = func_decl
@@ -1131,10 +1133,11 @@ impl Dtype {
         match &declarator_kind.node {
             ast::DeclaratorKind::Abstract => Ok(Named::new(None, self)),
             ast::DeclaratorKind::Identifier(identifier) => {
+                // 递归边界
                 Ok(Named::new(Some(identifier.node.name.clone()), self))
             }
             ast::DeclaratorKind::Declarator(declarator) => {
-                self.with_ast_declarator(&declarator.node)
+                self.with_ast_declarator(&declarator.node) // 递归处理，将添加了deriveddeclarator的dtype(self)作为新的base_dtype,调用with_ast_declarator
             }
         }
     }
@@ -1193,8 +1196,9 @@ impl Dtype {
                 is_const,
                 ..
             } => {
+                // 结构体有定义
                 let (name, fields) = if let Some(fields) = fields {
-                    let fields = fields
+                    let fields = fields // 对结构体的每个字段进行resolve_typedefs
                         .into_iter()
                         .map(|f| {
                             let (d, name) = f.destruct();
@@ -1204,6 +1208,7 @@ impl Dtype {
                         .collect::<Vec<_>>();
                     (name, Some(fields))
                 } else {
+                    // 结构体无定义，就不能是匿名的
                     assert!(name.is_some());
                     (name, fields)
                 };
@@ -1293,17 +1298,20 @@ impl Dtype {
                     let filled_struct =
                         resolved_struct.fill_size_align_offsets_of_struct(structs)?;
 
+                    // 将struct(匿名或不匿名)定义添加到struct表中
                     if let Some(prev_dtype) = structs.insert(name.clone(), Some(filled_struct)) {
                         if prev_dtype.is_some() {
                             return Err(DtypeError::Misc {
-                                message: format!("redefinition of {name}"),
+                                message: format!("redefinition of {name}"), // 不能重复定义一个struct
                             });
                         }
                     }
 
                     (name, None)
                 } else {
+                    // self只是引用struct A，没有定义
                     let name = name.expect("`name` must exist");
+                    // 引用前必须先定义了结构体A，才能resolve self这个Dtype::Struct
                     let struct_type = structs.get(&name).ok_or_else(|| DtypeError::Misc {
                         message: format!("unknown struct name `{name}`"),
                     })?;
@@ -1315,7 +1323,7 @@ impl Dtype {
 
                     (name, fields)
                 };
-                Self::structure(Some(name), fields).set_const(is_const)
+                Self::structure(Some(name), fields).set_const(is_const) // resolve成功，返回A对应的名字和空定义
             }
             Self::Function { ret, params } => {
                 let ret = ret.resolve_structs(structs, tempid_counter)?;

@@ -36,7 +36,7 @@
 //! [github-qna-irgen]: https://github.com/kaist-cp/cs420/labels/homework%20-%20irgen
 use core::cmp::Ordering;
 use core::convert::TryFrom;
-use core::{fmt, mem};
+use core::{fmt, mem, panic};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 
@@ -46,7 +46,7 @@ use lang_c::driver::Parse;
 use lang_c::span::Node;
 use thiserror::Error;
 
-use crate::ir::{DtypeError, HasDtype, Named};
+use crate::ir::{DtypeError, HasDtype, JumpArg, Named};
 use crate::write_base::WriteString;
 use crate::*;
 
@@ -147,6 +147,8 @@ impl Irgen {
 
     /// Add a declaration. It can be either a struct, typedef, or a variable.
     fn add_declaration(&mut self, source: &Declaration) -> Result<(), IrgenError> {
+        // assume for example we have some typedefs before: typedef int tt
+        // 解析DeclarationSpecifiers
         let (base_dtype, is_typedef) =
             ir::Dtype::try_from_ast_declaration_specifiers(&source.specifiers).map_err(|e| {
                 IrgenError::new(
@@ -154,6 +156,7 @@ impl Irgen {
                     IrgenErrorMessage::InvalidDtype { dtype_error: e },
                 )
             })?;
+        // 将specifier的Dtype(可能变体为Struct/Int/Float/Unit/Typedef),解析成不包含Typedef变体的Dtype(例如Struct中的fields不包含Typedef变体的Dtype)
         let base_dtype = base_dtype.resolve_typedefs(&self.typedefs).map_err(|e| {
             IrgenError::new(
                 format!("{source:#?}"),
@@ -161,6 +164,7 @@ impl Irgen {
             )
         })?;
 
+        // 如果typespecifier对应一个struct，先把结构体名字则添加到struct表中的,然后如果是struct的一个定义，则进行struct_resolve,返回一个无定义的struct Dtype(fields=None)
         let base_dtype = if let ir::Dtype::Struct { name, fields, .. } = &base_dtype {
             if let Some(name) = name {
                 let _ = self.structs.entry(name.to_string()).or_insert(None);
@@ -181,10 +185,11 @@ impl Irgen {
         } else {
             base_dtype
         };
-
+        // tt *a, b
         for init_decl in &source.declarators {
             let declarator = &init_decl.node.declarator.node;
-            let name = name_of_declarator(declarator);
+            let name = name_of_declarator(declarator); // a 和 b(2次循环中)
+
             let dtype = base_dtype
                 .clone()
                 .with_ast_declarator(declarator)
@@ -197,12 +202,17 @@ impl Irgen {
                 .deref()
                 .clone();
             let dtype = dtype.resolve_typedefs(&self.typedefs).map_err(|e| {
+                // 这里需要resolve_typedefs是因为Dtype的嵌套构造(Pointer,Array,Func)的Func构造中的params可能出现Dtype::Typedef,需要去除别名(同时检验别名是否均已定义)
                 IrgenError::new(
                     format!("{source:#?}"),
                     IrgenErrorMessage::InvalidDtype { dtype_error: e },
                 )
             })?;
+            // 此时dtype就是该Declaration中的一个声明子Declarator的完整类型，如int *(*f(struct A, int *))[3]去除了类型别名，进行了自定义类(struct)一致性检查
             if !is_typedef && is_invalid_structure(&dtype, &self.structs) {
+                // 为了定义具体变量(匿名或非匿名)，要求结构体类必须完整
+                // 例如：struct A;      // 声明，此时 A 是不完整类型，self.structs中没有A的定义，但有A的key
+                // struct A var;  错误！编译器不知道 A 多大，is_invalid_structure 返回 true
                 return Err(IrgenError::new(
                     format!("{source:#?}"),
                     IrgenErrorMessage::Misc {
@@ -231,7 +241,7 @@ impl Irgen {
                 continue;
             }
 
-            // Creates a new declaration based on the dtype.
+            // Creates a new declaration based on the dtype. 为每个declarator创建一个ir::Declaration，e.g. int a[3], *b; 要创建2个ir::Declaration
             let mut decl = ir::Declaration::try_from(dtype.clone()).map_err(|e| {
                 IrgenError::new(
                     format!("{source:#?}"),
@@ -291,6 +301,7 @@ impl Irgen {
         let name_of_params = name_of_params_from_function_declarator(declarator)
             .expect("declarator is not from function definition");
 
+        // 解析返回类型的基础部分
         let (base_dtype, is_typedef) = ir::Dtype::try_from_ast_declaration_specifiers(specifiers)
             .map_err(|e| {
             IrgenError::new(
@@ -308,6 +319,7 @@ impl Irgen {
             ));
         }
 
+        // 将基础类型和声明修饰符（指针、数组等）结合，形成完整的函数类型
         let dtype = base_dtype
             .with_ast_declarator(declarator)
             .map_err(|e| {
@@ -318,6 +330,7 @@ impl Irgen {
             })?
             .deref()
             .clone();
+        // 替换掉类型中的所有 typedef 别名
         let dtype = dtype.resolve_typedefs(&self.typedefs).map_err(|e| {
             IrgenError::new(
                 format!("specs: {specifiers:#?}\ndecl: {declarator:#?}"),
@@ -325,13 +338,18 @@ impl Irgen {
             )
         })?;
 
+        // 创建一个 FunctionSignature 对象，描述函数的返回类型和参数类型
         let signature = ir::FunctionSignature::new(dtype.clone());
 
+        // 函数定义同时也隐含了一个声明。将该函数加入到全局声明表 self.decls 中
         // Adds new declaration if nothing has been declared before
         let decl = ir::Declaration::try_from(dtype).unwrap();
         self.add_decl(&name, decl)?;
 
+        // 在翻译函数体之前，需要准备好一个“翻译现场” —— IrgenFunc 结构体。
+
         // Prepare scope for global variable
+        // 函数体内部可以访问全局变量。遍历当前所有的全局声明（self.decls），为每一个全局变量/函数创建一个 Constant::global_variable 指针
         let global_scope: HashMap<_, _> = self
             .decls
             .iter()
@@ -344,6 +362,7 @@ impl Irgen {
             .collect();
 
         // Prepares for irgen pass.
+        // 创建 IrgenFunc 实例：初始化块计数器（BID）、寄存器计数器（tempid）、分配列表（allocations）等
         let mut irgen = IrgenFunc {
             return_type: signature.ret.clone(),
             bid_init: Irgen::BID_INIT,
@@ -355,14 +374,21 @@ impl Irgen {
             typedefs: &self.typedefs,
             structs: &self.structs,
             // Initial symbol table has scope for global variable already
-            symbol_table: vec![global_scope],
+            symbol_table: vec![global_scope], // 将这些全局符号放入初始的 symbol_table（作用域栈的底层）
         };
+        // 创建一个 Context，从 BID_INIT 开始编写指令
         let mut context = Context::new(irgen.bid_init);
 
+        // 开启函数局部作用域
         // Enter variable scope for alloc registers matched with function parameters
         irgen.enter_scope();
 
         // Creates the init block that stores arguments.
+        // 先在self.allocations中为函数参数分配内存，用寄存器%l0、%l1...存储地址
+        // 根据函数参数类型设置self.phinodes_init, 即第一个block的phinodes，例如第一个参数为int a，则
+        // block 0 的第一个phinode为i32:a, RegisterId为%b0:p0
+        // 将block 0 上的phinode存储到%l0、%l1指向的内存, e.g. %b0:i0:unit = store %b0:p0:i32 %l0:i32*
+        // 将参数名和这些寄存器的映射存入符号表symbol_table,如a -> %l0:i32 这个映射
         irgen
             .translate_parameter_decl(&signature, irgen.bid_init, &name_of_params, &mut context)
             .map_err(|e| {
@@ -370,6 +396,7 @@ impl Irgen {
             })?;
 
         // Translates statement.
+        // 遍历函数的大括号 { ... } 里的所有语句，生成对应的 IR 指令, context 会记录生成的指令流，并可能根据 if/while 语句拆分成多个基本块
         irgen.translate_stmt(&source.statement.node, &mut context, None, None)?;
 
         // Creates the end block
@@ -590,9 +617,300 @@ impl IrgenFunc<'_> {
         bid_continue: Option<ir::BlockId>,
         bid_break: Option<ir::BlockId>,
     ) -> Result<(), IrgenError> {
-        todo!()
+        match stmt {
+            Statement::Compound(items) => {
+                self.enter_scope();
+                for item in items {
+                    match &item.node {
+                        BlockItem::StaticAssert(_) => {
+                            panic!("BlockItem::StaticAssert not supported")
+                        }
+                        BlockItem::Declaration(decl) => {
+                            self.translate_declaration(&decl.node, context)
+                                .map_err(|e| IrgenError {
+                                    code: decl.write_string(),
+                                    message: e,
+                                })?;
+                        }
+                        BlockItem::Statement(stmt) => {
+                            self.translate_stmt(&stmt.node, context, bid_continue, bid_break)?
+                        }
+                    }
+                }
+                self.exit_scope();
+                Ok(())
+            }
+            Statement::Expression(expr) => {
+                if let Some(expr) = expr {
+                    let _unused = self
+                        .translate_expr_rvalue(&expr.node, context)
+                        .map_err(|e| IrgenError::new(expr.write_string(), e))?;
+                }
+                Ok(())
+            }
+            Statement::If(stmt) => {
+                let then_stmt = &stmt.node.then_statement.node;
+                let else_stmt_opt = &stmt.node.else_statement;
+                let condition = &stmt.node.condition.node;
+
+                let then_bid = self.alloc_bid();
+                let else_bid = self.alloc_bid();
+                let end_bid = self.alloc_bid();
+
+                // translate condition into operand
+                let cond_operand = self
+                    .translate_condition(condition, context)
+                    .map_err(|e| IrgenError::new(condition.write_string(), e))?;
+
+                // 结束当前块：根据条件跳转
+                let tgt_else = if else_stmt_opt.is_some() {
+                    else_bid
+                } else {
+                    end_bid
+                };
+                self.insert_block(
+                    mem::replace(context, Context::new(then_bid)),
+                    ir::BlockExit::ConditionalJump {
+                        condition: cond_operand,
+                        arg_then: JumpArg::new(then_bid, vec![]),
+                        arg_else: JumpArg::new(tgt_else, vec![]),
+                    },
+                );
+
+                // then block, exit为跳转到end block
+                self.translate_stmt(then_stmt, context, bid_continue, bid_break)?;
+                self.insert_block(
+                    mem::replace(context, Context::new(else_bid)),
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(end_bid, vec![]),
+                    },
+                );
+
+                // else block (if exists)
+                if let Some(else_stmt) = else_stmt_opt {
+                    self.translate_stmt(&else_stmt.node, context, bid_continue, bid_break)?;
+                }
+                // 无论如何commit else block
+                self.insert_block(
+                    mem::replace(context, Context::new(end_bid)),
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(end_bid, vec![]),
+                    },
+                );
+                // 此时context 指向“接下来该写指令的地方”：end_bid
+                Ok(())
+            }
+            Statement::While(stmt) => {
+                let cond = &stmt.node.expression.node;
+                let loop_body = &stmt.node.statement.node;
+
+                let cond_bid = self.alloc_bid();
+                let loop_body_bid = self.alloc_bid();
+                let end_bid = self.alloc_bid();
+
+                // jump to the condition block
+                self.insert_block(
+                    mem::replace(context, Context::new(cond_bid)),
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(cond_bid, vec![]),
+                    },
+                );
+
+                // translate to get condition value
+                let cond_operand = self
+                    .translate_condition(cond, context)
+                    .map_err(|e| IrgenError::new(cond.write_string(), e))?;
+                self.insert_block(
+                    mem::replace(context, Context::new(loop_body_bid)),
+                    ir::BlockExit::ConditionalJump {
+                        condition: cond_operand,
+                        arg_then: JumpArg::new(loop_body_bid, vec![]),
+                        arg_else: JumpArg::new(end_bid, vec![]),
+                    },
+                );
+
+                // translate the loop body
+                self.translate_stmt(loop_body, context, Some(cond_bid), Some(end_bid))?;
+                // commit body block
+                self.insert_block(
+                    mem::replace(context, Context::new(end_bid)),
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(cond_bid, vec![]),
+                    },
+                );
+                Ok(())
+            }
+            _ => todo!(),
+        }
     }
 
+    // 检查声明类型，local allocation，必要时初始化变量(store)
+    fn translate_declaration(
+        &mut self,
+        decl: &Declaration,
+        context: &mut Context,
+    ) -> Result<(), IrgenErrorMessage> {
+        let (base_dtype, is_typedef) =
+            ir::Dtype::try_from_ast_declaration_specifiers(&decl.specifiers)
+                .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+
+        // resolve typedefs
+        let base_dtype = base_dtype
+            .resolve_typedefs(self.typedefs)
+            .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+
+        // 函数内部不支持typedef
+        assert!(!is_typedef);
+        // 函数内部不支持定义结构体类型。检查结构体类型是否已被定义(使用辅助函数is_invalid_structure)
+        if is_invalid_structure(&base_dtype, self.structs) {
+            return Err(IrgenErrorMessage::Misc {
+                message: format!("{} has incomplete type!", base_dtype),
+            });
+        }
+
+        for init_decl in &decl.declarators {
+            let declarator = &init_decl.node.declarator.node;
+            let var = name_of_declarator(declarator); // 变量名字
+
+            let dtype = base_dtype
+                .clone()
+                .with_ast_declarator(declarator)
+                .map_err(|e| {
+                    IrgenErrorMessage::InvalidDtype { dtype_error: e } // 变量类型
+                })?
+                .deref()
+                .clone();
+
+            // resolve typedefs
+            let dtype = dtype
+                .resolve_typedefs(self.typedefs)
+                .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+
+            // translate initializer并根据其返回的operand初始化变量var
+            match &dtype {
+                ir::Dtype::Unit { .. } => todo!(),
+                ir::Dtype::Int { .. }
+                | ir::Dtype::Float { .. }
+                | ir::Dtype::Pointer { .. }
+                | ir::Dtype::Array { .. } => {
+                    let value = if let Some(initializer) = &init_decl.node.initializer {
+                        Some(self.translate_initializer(&initializer.node, context)?)
+                    } else {
+                        None
+                    };
+                    let _unused =
+                        self.translate_alloc(var.clone(), dtype.clone(), value, context)?;
+                }
+                ir::Dtype::Function { .. } => todo!(),
+                ir::Dtype::Typedef { .. } => {
+                    panic!("typedef should be reduced to real types");
+                }
+                ir::Dtype::Struct { .. } => todo!(),
+            }
+        }
+        Ok(())
+    }
+
+    fn translate_initializer(
+        &mut self,
+        initializer: &Initializer,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        match initializer {
+            Initializer::Expression(expr) => self.translate_expr_rvalue(&expr.node, context),
+            Initializer::List(_) => panic!("Initializer::List is unsupported"), // 重点，{1, 2, 3},{.a = init, .b = init2}这种形式的初始化暂时不支持，因为比较复杂
+        }
+    }
+
+    fn translate_expr_rvalue(
+        &mut self,
+        expr: &Expression,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        match expr {
+            Expression::Identifier(id) => {
+                let ptr = self.lookup_symbol_table(&id.node.name)?;
+                let dtype_of_ptr = ptr.dtype();
+                let ptr_inner_type = dtype_of_ptr
+                    .get_pointer_inner()
+                    .ok_or_else(|| panic!("`Operand` from `symbol_table` must be pointer type"))?;
+
+                // 如果ptr指向一个函数，就返回ptr本身
+                if ptr_inner_type.get_function_inner().is_some() {
+                    return Ok(ptr);
+                }
+
+                // int a[10]; 则ptr类型为[10 x i32]*, 需要转换成i32*操作数
+                if let Some(array_inner) = ptr_inner_type.get_array_inner() {
+                    // we convert array into pointer
+                    return self.convert_array_to_pointer(ptr, array_inner.clone(), context);
+                }
+                context.insert_instruction(ir::Instruction::Load { ptr })
+            }
+            _ => todo!(),
+        }
+    }
+
+    fn lookup_symbol_table(&self, name: &str) -> Result<ir::Operand, IrgenErrorMessage> {
+        for scope in self.symbol_table.iter().rev() {
+            if let Some(operand) = scope.get(name) {
+                return Ok(operand.clone());
+            }
+        }
+        Err(IrgenErrorMessage::Misc {
+            message: format!("{} not found in symbol table", name),
+        })
+    }
+
+    // 将数组指针转换为指向其首元素的指针 (Array-to-pointer decay)
+    fn convert_array_to_pointer(
+        &mut self,
+        ptr: ir::Operand,
+        inner_dtype: ir::Dtype,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        let tgt_ptr_type = ir::Dtype::pointer(inner_dtype);
+        let offset = ir::Operand::constant(ir::Constant::int(0, ir::Dtype::LONG));
+
+        context.insert_instruction(ir::Instruction::GetElementPtr {
+            ptr,
+            offset,
+            dtype: tgt_ptr_type,
+        })
+    }
+
+    fn translate_condition(
+        &mut self,
+        expr: &Expression,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        let val = self.translate_expr_rvalue(expr, context)?;
+        let dtype = val.dtype();
+
+        if dtype == ir::Dtype::BOOL {
+            return Ok(val);
+        }
+        // 否则，生成"val != 0"的逻辑
+        let zero = if dtype.get_int_width().is_some() {
+            ir::Operand::constant(ir::Constant::int(0, dtype.clone()))
+        } else if dtype.get_float_width().is_some() {
+            ir::Operand::constant(ir::Constant::float(0.0, dtype.clone()))
+        } else if dtype.get_pointer_inner().is_some() {
+            ir::Operand::constant(ir::Constant::int(0, ir::Dtype::LONG))
+        } else {
+            return Err(IrgenErrorMessage::Misc {
+                message: format!("expected scalar type in condition, found {}", dtype),
+            });
+        };
+
+        // 插入比较指令
+        context.insert_instruction(ir::Instruction::BinOp {
+            op: BinaryOperator::NotEquals,
+            lhs: val,
+            rhs: zero,
+            dtype: ir::Dtype::BOOL, // 返回的比较结果(temp register)是BOOL类型
+        })
+    }
     /// Translate initial parameter declarations of the functions to IR.
     ///
     /// For example, given the following C function from [`foo.c`][foo]:
@@ -666,7 +984,74 @@ impl IrgenFunc<'_> {
         name_of_params: &[String],
         context: &mut Context,
     ) -> Result<(), IrgenErrorMessage> {
-        todo!()
+        if signature.params.len() != name_of_params.len() {
+            panic!("len of `parameters ` and `name_of_params` must be same")
+        }
+        // 对每个block arguments
+        for (i, (dtype, var)) in izip!(&signature.params, name_of_params).enumerate() {
+            // 设置 IrGenFunc的phinodes_init，在insert block时让入口块知道有这个参数声明
+            self.phinodes_init
+                .push(Named::new(Some(var.clone()), dtype.clone()));
+
+            // 构造指向该参数的寄存器操作数 (%bid:pi)
+            let value = Some(ir::Operand::register(
+                ir::RegisterId::arg(bid_init, i),
+                dtype.clone(),
+            ));
+            // allocate variables 并将block argument的值用于初始化(store指令)
+            let _unused = self.translate_alloc(var.clone(), dtype.clone(), value, context)?;
+        }
+        Ok(())
+    }
+
+    fn translate_alloc(
+        &mut self,
+        var: String,                // the name of the var which is to be allocated
+        dtype: ir::Dtype,           // the dtype of the var
+        value: Option<ir::Operand>, // if is_some() store the value to initialize the memory location
+        context: &mut Context,      // add instrs to context
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        // insert allocation, and get the allocation's registerId: aid
+        let rid = self.insert_alloc(Named::new(Some(var.clone()), dtype.clone()));
+
+        // Create Pointer
+        let pointer_type = ir::Dtype::pointer(dtype.clone());
+        let ptr_register = ir::Operand::register(rid, pointer_type);
+        self.insert_symbol_table_entry(var, ptr_register.clone())?; // 变量var用ptr_register这个operand指代
+
+        // initialize allocated variables if `value ` is not `None`
+        if let Some(value) = value {
+            // implicit type_cast，例如
+            // void foo(float x)
+            // foo(3);
+            let value = self.translate_typecast(value, dtype, context)?; // 将用于初始化变量的Operand typecast成dtype目标类型
+            return context.insert_instruction(ir::Instruction::Store {
+                ptr: ptr_register,
+                value,
+            }); // 返回Store指令结果：temp register
+        }
+        Ok(ptr_register) // 返回指代该variable的register
+    }
+
+    fn translate_typecast(
+        &mut self,
+        value: ir::Operand,
+        dtype: ir::Dtype,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        // 类型一致，直接返回原始操作数
+        if value.dtype() == dtype {
+            return Ok(value);
+        }
+        // 如果操作数是一个常量，尝试进行Constant Folding，减少运行时指令开销
+        if let ir::Operand::Constant(constant) = value {
+            return Ok(ir::Operand::constant(constant.typecast(dtype)));
+        }
+
+        context.insert_instruction(ir::Instruction::TypeCast {
+            value,
+            target_dtype: dtype,
+        }) // 返回指代类型转换结果的临时寄存器
     }
 }
 
@@ -728,6 +1113,7 @@ fn name_of_parameter_declaration(parameter_declaration: &ParameterDeclaration) -
     Some(name_of_declarator(&declarator.node))
 }
 
+// 判断initializer是否是编译时期可确定的`常量表达式`，因为全局变量的初始化值必须是常量表达式
 #[inline]
 fn is_valid_initializer(
     initializer: &Initializer,
@@ -741,7 +1127,7 @@ fn is_valid_initializer(
                     Expression::Constant(_) => true,
                     Expression::UnaryOperator(unary) => matches!(
                         &unary.node.operator.node,
-                        UnaryOperator::Minus | UnaryOperator::Plus
+                        UnaryOperator::Minus | UnaryOperator::Plus // 不支持1 + 2 或 &...
                     ),
                     _ => false,
                 }
@@ -777,9 +1163,16 @@ fn is_valid_initializer(
 #[inline]
 fn is_invalid_structure(dtype: &ir::Dtype, structs: &HashMap<String, Option<ir::Dtype>>) -> bool {
     // When `dtype` is `Dtype::Struct`, `structs` has real definition of `dtype`
+    // 断言：这里的 dtype 实例应该是“引用形式”的结构体
+    // 即：它必须有名字，且它内部不直接携带字段信息（fields 为 None）
+    // 因为完整的定义已经存放在了 Irgen 的全局 structs 表中
     if let ir::Dtype::Struct { name, fields, .. } = dtype {
-        assert!(name.is_some() && fields.is_none());
+        assert!(name.is_some() && fields.is_none()); // Dtype是struct且fields为空
         let name = name.as_ref().unwrap();
+        // 核心逻辑：判断该结构体是否在全局表里“没有定义”
+        // .is_none_or(Option::is_none) 处理了两种情况：
+        // 1. structs.get(name) 返回 None -> 说明该结构体名字连声明都没见过。
+        // 2. structs.get(name) 返回 Some(None) -> 说明见过声明（如 struct A;），但还没见到大括号定义的成员。
         structs.get(name).is_none_or(Option::is_none)
     } else {
         false

@@ -553,10 +553,11 @@ impl RegisterId {
         Self::Temp { bid, iid }
     }
 
+    // 在函数执行过程中，该寄存器所代表的值是否是在函数入口处就已经确定、且其定义不依赖于任何运行时指令计算的
     pub fn is_const(&self, bid_init: BlockId) -> bool {
         match self {
-            Self::Local { .. } => true,
-            Self::Arg { bid, .. } => bid == &bid_init,
+            Self::Local { .. } => true, // 局部变量的内存地址（类似于 LLVM 的 alloca 指令返回的指针）在函数入口即确定
+            Self::Arg { bid, .. } => bid == &bid_init, // 函数参数作为第一个block的Phinode是入口即确定
             _ => false,
         }
     }
@@ -612,8 +613,13 @@ impl Hash for RegisterId {
     }
 }
 
+// 全局变量 @g 的内存地址在程序启动时就是固定好的，也就是说全局变量在 IR 中被视为一个指向其类型的指针常量，所以Constant包含GlobalVariable变体
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Constant {
+    // int x;
+    // return x; IRgen产生Constant::Undef { dtype: i32 } 结果是未定义的
+    // 例如：如果在 C 语言中一个有返回值的函数（非 main）最后漏写了 return 语句，程序运行到那里会产生未定义行为。
+    // IR 通过返回一个 Undef 常量来明确地在代码路径上“占座”，保证 IR 的控制流结构（每个 Basic Block 必须以退出指令结束）是完整的
     Undef {
         dtype: Dtype,
     },
@@ -669,6 +675,8 @@ impl TryFrom<&ast::Constant> for Constant {
                     // to minus value. For this reason, if the sign bit is on, dtype automatically
                     // transformed to `unsigned`. Let's say integer literal is `0xFFFFFFFF`,
                     // it translated to unsigned integer even though it has no `U` suffix.
+                    // 解释：C语言的 AST 解析中，-5 并不是一个常量，而是“负号运算符 -”作用在“常量 5”上。所以这里解析出来的 value 永远代表源代码里那个数字的绝对值
+                    // 如果value超出了有符号整数的表示范围，即使没有 u 后缀，它也会被视为 unsigned。例如0xFFFFFFFF被视为unsigned int而不是-1:signed_int
                     let width = dtype.get_int_width().unwrap();
                     let threshold = 1u128 << (width as u128 - 1);
                     value < threshold
@@ -979,7 +987,7 @@ impl HasDtype for Constant {
                 width, is_signed, ..
             } => Dtype::int(*width).set_signed(*is_signed),
             Self::Float { width, .. } => Dtype::float(*width),
-            Self::GlobalVariable { dtype, .. } => Dtype::pointer(dtype.clone()),
+            Self::GlobalVariable { dtype, .. } => Dtype::pointer(dtype.clone()), // globalvariable本质是指针，如@p就是一个指向变量p的常量指针
         }
     }
 }
