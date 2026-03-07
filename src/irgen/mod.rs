@@ -37,8 +37,9 @@
 use core::cmp::Ordering;
 use core::convert::TryFrom;
 use core::{fmt, mem, panic};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, binary_heap};
 use std::ops::Deref;
+use std::{default, u128};
 
 use itertools::izip;
 use lang_c::ast::*;
@@ -46,6 +47,7 @@ use lang_c::driver::Parse;
 use lang_c::span::Node;
 use thiserror::Error;
 
+use crate::asm::Block;
 use crate::ir::{DtypeError, HasDtype, JumpArg, Named};
 use crate::write_base::WriteString;
 use crate::*;
@@ -399,7 +401,7 @@ impl Irgen {
         // 遍历函数的大括号 { ... } 里的所有语句，生成对应的 IR 指令, context 会记录生成的指令流，并可能根据 if/while 语句拆分成多个基本块
         irgen.translate_stmt(&source.statement.node, &mut context, None, None)?;
 
-        // Creates the end block
+        // Creates the end block(对应函数末尾，此时没有任何语句，但我们有默认的返回逻辑)
         let ret = signature.ret.set_const(false);
         let value = if ret == ir::Dtype::unit() {
             ir::Operand::constant(ir::Constant::unit())
@@ -740,7 +742,186 @@ impl IrgenFunc<'_> {
                 );
                 Ok(())
             }
-            _ => todo!(),
+            Statement::DoWhile(stmt) => {
+                let expr = &stmt.node.expression.node;
+                let body = &stmt.node.statement.node;
+
+                let loop_bid = self.alloc_bid();
+                let cond_bid = self.alloc_bid();
+                let end_bid = self.alloc_bid();
+
+                self.insert_block(
+                    mem::replace(context, Context::new(loop_bid)),
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(loop_bid, vec![]),
+                    },
+                );
+
+                self.translate_stmt(body, context, Some(cond_bid), Some(end_bid))?;
+                self.insert_block(
+                    mem::replace(context, Context::new(cond_bid)),
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(cond_bid, vec![]),
+                    },
+                );
+
+                let cond_operand = self
+                    .translate_condition(expr, context)
+                    .map_err(|e| IrgenError::new(expr.write_string(), e))?;
+                self.insert_block(
+                    mem::replace(context, Context::new(end_bid)),
+                    ir::BlockExit::ConditionalJump {
+                        condition: cond_operand,
+                        arg_then: JumpArg::new(loop_bid, vec![]),
+                        arg_else: JumpArg::new(end_bid, vec![]),
+                    },
+                );
+
+                Ok(())
+            }
+            Statement::For(stmt) => {
+                let init = &stmt.node.initializer.node;
+                let cond_opt = &stmt.node.condition;
+                let step_opt = &stmt.node.step;
+                let body = &stmt.node.statement.node;
+
+                let cond_bid = self.alloc_bid();
+                let step_bid = self.alloc_bid();
+                let loop_bid = self.alloc_bid();
+                let end_bid = self.alloc_bid();
+
+                self.enter_scope();
+                match init {
+                    ForInitializer::Declaration(decl) => {
+                        self.translate_declaration(&decl.node, context)
+                            .map_err(|e| IrgenError::new(decl.write_string(), e))?;
+                    }
+                    ForInitializer::Empty => {}
+                    ForInitializer::Expression(expr) => {
+                        let _unused = self
+                            .translate_expr_rvalue(&expr.node, context)
+                            .map_err(|e| IrgenError::new(expr.write_string(), e))?;
+                    }
+                    ForInitializer::StaticAssert(_) => {
+                        panic!("ForInitializer::StaticAssert not supported");
+                    }
+                }
+
+                self.insert_block(
+                    mem::replace(context, Context::new(cond_bid)),
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(cond_bid, vec![]),
+                    },
+                );
+
+                let cond_operand = if let Some(cond_expr) = cond_opt {
+                    self.translate_condition(&cond_expr.node, context)
+                        .map_err(|e| IrgenError::new(cond_expr.write_string(), e))?
+                } else {
+                    ir::Operand::constant(ir::Constant::int(1, ir::Dtype::BOOL))
+                };
+
+                self.insert_block(
+                    mem::replace(context, Context::new(loop_bid)),
+                    ir::BlockExit::ConditionalJump {
+                        condition: cond_operand,
+                        arg_then: JumpArg::new(loop_bid, vec![]),
+                        arg_else: JumpArg::new(end_bid, vec![]),
+                    },
+                );
+
+                self.translate_stmt(body, context, Some(step_bid), Some(end_bid))?;
+                self.insert_block(
+                    mem::replace(context, Context::new(step_bid)),
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(step_bid, vec![]),
+                    },
+                );
+
+                if let Some(step_expr) = step_opt {
+                    let _unused = self
+                        .translate_expr_rvalue(&step_expr.node, context)
+                        .map_err(|e| IrgenError::new(step_expr.write_string(), e))?;
+                }
+                self.insert_block(
+                    mem::replace(context, Context::new(end_bid)),
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(cond_bid, vec![]),
+                    },
+                );
+
+                self.exit_scope();
+                Ok(())
+            }
+            Statement::Asm(_) => panic!("Statement::Asm not supported"),
+            Statement::Labeled(stmt) => {
+                panic!("Statement::Labeled not supported");
+            }
+            Statement::Goto(_) => panic!("Statement::Goto"),
+            Statement::Switch(stmt) => {
+                let value = self
+                    .translate_expr_rvalue(&stmt.node.expression.node, context)
+                    .map_err(|e| IrgenError::new(stmt.node.expression.node.write_string(), e))?;
+                let bid_end = self.alloc_bid();
+                let (cases, bid_default) =
+                    self.translate_switch_body(&stmt.node.statement.node, bid_end)?; // 这里不影响context
+
+                self.insert_block(
+                    mem::replace(context, Context::new(bid_end)),
+                    ir::BlockExit::Switch {
+                        value: value,
+                        default: JumpArg::new(bid_default, vec![]),
+                        cases,
+                    },
+                );
+
+                Ok(())
+            }
+            Statement::Continue => {
+                let bid_continue = bid_continue.unwrap_or_else(|| panic!("no bid_continue"));
+                let next_bid = self.alloc_bid();
+                self.insert_block(
+                    mem::replace(context, Context::new(next_bid)),
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(bid_continue, vec![]),
+                    },
+                );
+                // the code after `continue` maybe deadcode
+                Ok(())
+            }
+            Statement::Break => {
+                let bid_break = bid_break.unwrap_or_else(|| panic!("no bid_break"));
+                let next_bid = self.alloc_bid();
+                self.insert_block(
+                    mem::replace(context, Context::new(next_bid)),
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(bid_break, vec![]),
+                    },
+                );
+                // the code after `break` maybe deadcode
+                Ok(())
+            }
+            Statement::Return(expr_opt) => {
+                let ret_operand = if let Some(expr) = expr_opt {
+                    let val = self
+                        .translate_expr_rvalue(&expr.node, context)
+                        .map_err(|e| IrgenError::new(expr.write_string(), e))?;
+                    // 隐式转换为函数返回类型 self.return_type
+                    self.translate_typecast(val, self.return_type.clone(), context)
+                        .map_err(|e| IrgenError::new(expr.write_string(), e))?
+                } else {
+                    // return; 返回单位值unit
+                    ir::Operand::constant(ir::Constant::unit())
+                };
+
+                let next_bid = self.alloc_bid();
+                self.insert_block(
+                    mem::replace(context, Context::new(next_bid)),
+                    ir::BlockExit::Return { value: ret_operand },
+                );
+
+                Ok(())
+            }
         }
     }
 
@@ -847,8 +1028,152 @@ impl IrgenFunc<'_> {
                 }
                 context.insert_instruction(ir::Instruction::Load { ptr })
             }
-            _ => todo!(),
+            Expression::Constant(constant) => {
+                let constant = ir::Constant::try_from(&constant.node)
+                    .expect("`constant` must be interpreted to `ir::Constant` value");
+                Ok(ir::Operand::constant(constant))
+            }
+            Expression::StringLiteral(_string_lit) => {
+                panic!("Expression::StringLiteral not supported")
+            }
+            Expression::GenericSelection(_) => panic!("Expression::GenericSelection not supported"),
+            Expression::Member(member) => {
+                // hard
+                // 计算成员所属对象的起始地址
+                let base_ptr = match member.node.operator.node {
+                    MemberOperator::Direct => {
+                        // a.b -> 先获取a的左值(地址)
+                        self.translate_expr_lvalue(&member.node.expression.node, context)?
+                    }
+                    MemberOperator::Indirect => {
+                        // a->b -> 先获取a的右值(隐含a是个指针)
+                        self.translate_expr_rvalue(&member.node.expression.node, context)?
+                    }
+                };
+
+                let base_dtype = base_ptr.dtype();
+                let struct_dtype =
+                    base_dtype
+                        .get_pointer_inner()
+                        .ok_or_else(|| IrgenErrorMessage::Misc {
+                            message: "member access on non-pointer type".to_string(),
+                        })?;
+                // 在结构体定义中查找字段的偏移量和类型
+                // 这里利用Dtype方法get_offset_struct_field
+                let field_name = &member.node.identifier.node.name;
+                let (offset, field_dtype) = struct_dtype
+                    .get_offset_struct_field(field_name, &self.structs)
+                    .ok_or_else(|| IrgenErrorMessage::Misc {
+                        message: format!("field {} not found in struct", field_name),
+                    })?;
+
+                // 使用GetElementPtr计算字段地址
+                let field_ptr = context.insert_instruction(ir::Instruction::GetElementPtr {
+                    ptr: base_ptr,
+                    offset: ir::Operand::constant(ir::Constant::int(
+                        offset as u128,
+                        ir::Dtype::LONG,
+                    )),
+                    dtype: ir::Dtype::pointer(field_dtype.clone()),
+                })?;
+
+                // 如果该字段是数组类型，例如a.b中b是一个数组[i32 x 5],那么该字段作为右值退化成首元素的指针
+                // 函数则直接返回指向函数的指针
+                // 否则load
+                if let Some(array_inner) = field_dtype.get_array_inner() {
+                    self.convert_array_to_pointer(field_ptr, array_inner.clone(), context)
+                } else if field_dtype.get_function_inner().is_some() {
+                    Ok(field_ptr)
+                } else {
+                    context.insert_instruction(ir::Instruction::Load { ptr: field_ptr })
+                }
+            }
+            Expression::Call(call) => self.translate_func_call(&call.node, context),
+            Expression::SizeOfTy(sz_ty) => {
+                // sizeof(T) -> 编译器常量
+                let dtype = ir::Dtype::try_from(&sz_ty.node.0.node)
+                    .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+                let dtype = dtype
+                    .resolve_typedefs(&self.typedefs)
+                    .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+
+                let (size, _) = dtype
+                    .size_align_of(&self.structs)
+                    .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+
+                Ok(ir::Operand::constant(ir::Constant::int(
+                    size as u128,
+                    ir::Dtype::LONG,
+                )))
+            }
+            Expression::SizeOfVal(sz_val) => {
+                // sizeof(expr) -> 在 C 中表达式不求值，只需知道其类型
+                // 这里我们通过临时翻译来获取表达式结果的Dtype(todo: 如何消除临时翻译过程中可能的副作用)
+                let operand = self.translate_expr_rvalue(&sz_val.node.0.node, context)?;
+
+                let (size, _) = operand
+                    .dtype()
+                    .size_align_of(&self.structs)
+                    .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+
+                Ok(ir::Operand::constant(ir::Constant::int(
+                    size as u128,
+                    ir::Dtype::LONG,
+                )))
+            }
+            Expression::AlignOf(typename) => {
+                let dtype = ir::Dtype::try_from(&typename.node.0.node)
+                    .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+                let dtype = dtype
+                    .resolve_typedefs(&self.typedefs)
+                    .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+                let (_, align_of) = dtype
+                    .size_align_of(&self.structs)
+                    .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+                Ok(ir::Operand::constant(ir::Constant::int(
+                    align_of as u128,
+                    ir::Dtype::LONG,
+                )))
+            }
+            Expression::UnaryOperator(unary) => self.translate_unary_op(&unary.node, context),
+            Expression::Cast(cast) => {
+                let tgt_dtype = ir::Dtype::try_from(&cast.node.type_name.node)
+                    .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+                let tgt_dtype = tgt_dtype
+                    .resolve_typedefs(&self.typedefs)
+                    .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+                let operand = self.translate_expr_rvalue(&cast.node.expression.node, context)?;
+                self.translate_typecast(operand, tgt_dtype, context)
+            }
+            Expression::BinaryOperator(binary) => self.translate_binary_op(
+                binary.node.operator.node.clone(),
+                &binary.node.lhs.node,
+                &binary.node.rhs.node,
+                context,
+            ),
+            Expression::Conditional(conditional) => {
+                self.translate_conditional(&conditional.node, context)
+            }
+            Expression::Comma(exprs) => {
+                // (e1, e2, ... , en) 依次执行，返回最后一个表达式的值
+                let mut last_op = None;
+                for expr in exprs.deref() {
+                    last_op = Some(self.translate_expr_rvalue(&expr.node, context)?);
+                }
+                last_op.ok_or_else(|| panic!("empty comma expression"))
+            }
+            _ => panic!(
+                "CompoundLiteral, OffsetOf, VaArg, Statement variant of `Expression` is unsupported"
+            ),
         }
+    }
+
+    fn translate_expr_lvalue(
+        &mut self,
+        expr: &Expression,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        todo!()
     }
 
     fn lookup_symbol_table(&self, name: &str) -> Result<ir::Operand, IrgenErrorMessage> {
@@ -1052,6 +1377,382 @@ impl IrgenFunc<'_> {
             value,
             target_dtype: dtype,
         }) // 返回指代类型转换结果的临时寄存器
+    }
+
+    fn translate_switch_body(
+        &mut self,
+        stmt: &Statement,
+        bid_end: ir::BlockId,
+    ) -> Result<(Vec<(ir::Constant, JumpArg)>, ir::BlockId), IrgenError> {
+        // switch的翻译局限于如下形式
+        // switch (e) {
+        //  case 1: {A1; break;}
+        //  case 2: {A2; break;}
+        //  default: D;
+        // }
+        // B;
+        // 检查是复合语句
+        let items = if let Statement::Compound(items) = stmt {
+            items
+        } else {
+            panic!("`Statement` in the `switch` is not supported except `Statement::Compound`")
+        };
+
+        let mut cases: Vec<(ir::Constant, JumpArg)> = Vec::new();
+        let mut default = None;
+        self.enter_scope();
+        // 检查每个子句都是statement
+        for item in items {
+            match &item.node {
+                BlockItem::Statement(stmt) => {
+                    self.translate_switch_body_inner(
+                        &stmt.node,
+                        &mut cases,
+                        &mut default,
+                        bid_end,
+                    )?;
+                }
+                _ => panic!(
+                    "BlockItem::StaticAssert and Declaration is unsupported in `Switch`'s compound statement"
+                ),
+            }
+        }
+        // if default is not present, just jump to `bid_end`
+        let default = default.unwrap_or(bid_end);
+        Ok((cases, default))
+    }
+
+    fn translate_switch_body_inner(
+        &mut self,
+        stmt: &Statement,
+        cases: &mut Vec<(ir::Constant, JumpArg)>,
+        default: &mut Option<ir::BlockId>,
+        bid_end: ir::BlockId,
+    ) -> Result<(), IrgenError> {
+        let label_stmt = if let Statement::Labeled(label_stmt) = stmt {
+            &label_stmt.node
+        } else {
+            panic!(
+                "`BlockItem::Statement` in the `Statement::Compound` of the `switch` \
+                    is unsupported except `Statement::Labeled`
+            "
+            )
+        };
+        let bid = self.alloc_bid();
+        // get case value from constant expr
+        let case = match &label_stmt.label.node {
+            Label::Identifier(_) => panic!("Label::Identifier not supported"),
+            Label::Case(expr) => {
+                let constant = ir::Constant::try_from(&expr.node).map_err(|_| {
+                    IrgenError::new(
+                        expr.write_string(),
+                        IrgenErrorMessage::Misc {
+                            message: "case label does not reduce to an integer constant"
+                                .to_string(),
+                        },
+                    )
+                })?;
+                Some(constant)
+            }
+            Label::CaseRange(_) => panic!("Label::CaseRange not supported"),
+            Label::Default => None,
+        };
+        let items = if let Statement::Compound(items) = &label_stmt.statement.node {
+            items
+        } else {
+            panic!("Statement in label must be `Statement::Compound`")
+        };
+
+        // 为这个label compound statement创建分支：语句块
+        let mut context = Context::new(bid);
+        self.enter_scope();
+        let (last, items) = items.split_last().expect("Statement::Compound has no item");
+
+        // 翻译compound stmt里的items(除了最后一个BlockItem)
+        for item in items {
+            match &item.node {
+                BlockItem::Declaration(decl) => self
+                    .translate_declaration(&decl.node, &mut context)
+                    .map_err(|e| IrgenError::new(decl.write_string(), e))?,
+                BlockItem::Statement(stmt) => {
+                    self.translate_stmt(&stmt.node, &mut context, None, None)?;
+                }
+                BlockItem::StaticAssert(_) => {
+                    panic!("BlockItem::StaticAssert not supported");
+                }
+            }
+        }
+
+        // last element of the `Compound` items must be Statement::Break
+        let last_stmt = if let BlockItem::Statement(stmt) = &last.node {
+            &stmt.node
+        } else {
+            panic!("BlockItem in Statement::Compound of the `label` must be BlockItem::Statement ")
+        };
+        assert_eq!(
+            last_stmt,
+            &Statement::Break,
+            "the last `BlockItem` in `Statement::Compound` of the `label` must be Statement::Break"
+        );
+
+        self.insert_block(
+            context,
+            ir::BlockExit::Jump {
+                arg: JumpArg::new(bid_end, vec![]),
+            },
+        );
+        self.exit_scope();
+
+        // 根据`case`是否有值更新cases和default参数
+        if let Some(case) = case {
+            // 检查case value是否为整型
+            if !case.is_integer_constant() {
+                return Err(IrgenError::new(
+                    label_stmt.label.write_string(),
+                    IrgenErrorMessage::Misc {
+                        message: "expression is not integer constant expression".to_string(),
+                    },
+                ));
+            }
+            // 检查cases里是否之前已经有这个case值了
+            // todo: consider the case that same `value` but different `width`
+            if cases.iter().any(|(c, _)| &case == c) {
+                return Err(IrgenError::new(
+                    label_stmt.label.write_string(),
+                    IrgenErrorMessage::Misc {
+                        message: "duplicate case value".to_string(),
+                    },
+                ));
+            }
+
+            cases.push((case, JumpArg::new(bid, vec![])));
+        } else {
+            // 检查default没有被重复定义过
+            if default.is_some() {
+                return Err(IrgenError::new(
+                    label_stmt.label.write_string(),
+                    IrgenErrorMessage::Misc {
+                        message: "previous default already exists".to_string(),
+                    },
+                ));
+            }
+            *default = Some(bid);
+        }
+
+        Ok(())
+    }
+
+    // insert_block 实现对非初始块默认使用空的 Phi 节点（Vec::new()）,且使用 allocations 处理局部存储
+    // 因此我们使用临时局部变量来保存then & else block中计算表达式得到的值
+    // 1. 分配块 ID：分配 then 块、else 块和 end 块。
+    // 2. 翻译条件：计算 cond 并根据结果执行 ConditionalJump
+    // 3. 处理 Then 分支：翻译 then 表达式，确定结果类型，并在栈上 alloc 一个临时空间，将结果 store 进去
+    // 4. 处理 Else 分支：翻译 else 表达式，将其转换为与 then 分支相同的类型，同样 store 到那个临时空间。
+    // 5. 汇总：在 end 块执行 load，获取最终结果
+    fn translate_conditional(
+        &mut self,
+        cond_expr: &ConditionalExpression,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        let then_bid = self.alloc_bid();
+        let else_bid = self.alloc_bid();
+        let end_bid = self.alloc_bid();
+
+        let cond_val = self.translate_condition(&cond_expr.condition.node, context)?;
+        self.insert_block(
+            mem::replace(context, Context::new(then_bid)),
+            ir::BlockExit::ConditionalJump {
+                condition: cond_val,
+                arg_then: JumpArg::new(then_bid, vec![]),
+                arg_else: JumpArg::new(else_bid, vec![]),
+            },
+        );
+
+        let v_then = self.translate_expr_rvalue(&cond_expr.then_expression.node, context)?;
+        let res_dtype = v_then.dtype();
+
+        // 在函数栈上分配临时空间用来存放三元运算的结果
+        let tmp_reg = self.insert_alloc(Named::new(None, res_dtype.clone()));
+        let tmp_ptr = ir::Operand::register(tmp_reg, res_dtype.clone());
+        // 将 Then 的结果存入临时空间
+        let _unused = context.insert_instruction(ir::Instruction::Store {
+            ptr: tmp_ptr.clone(),
+            value: v_then,
+        })?;
+
+        self.insert_block(
+            mem::replace(context, Context::new(else_bid)),
+            ir::BlockExit::Jump {
+                arg: JumpArg::new(end_bid, vec![]),
+            },
+        );
+
+        let v_else = self.translate_expr_rvalue(&cond_expr.else_expression.node, context)?;
+        // 隐式转化
+        // 在 C 语言标准中，三元运算符的结果类型是两个分支的“公共类型”。为了简化实验实现，这里以 then 分支的类型作为目标类型，并对 else 分支进行 typecast
+        let v_else_casted = self.translate_typecast(v_else, res_dtype, context)?;
+        // 将else结果存入同一个临时空间
+        let _unused = context.insert_instruction(ir::Instruction::Store {
+            ptr: tmp_ptr.clone(),
+            value: v_else_casted,
+        })?;
+
+        self.insert_block(
+            mem::replace(context, Context::new(end_bid)),
+            ir::BlockExit::Jump {
+                arg: JumpArg::new(end_bid, vec![]),
+            },
+        );
+
+        // 在汇合点(end_bid)执行Load并返回其值
+        context.insert_instruction(ir::Instruction::Load { ptr: tmp_ptr })
+    }
+
+    fn translate_func_call(
+        &mut self,
+        call: &CallExpression,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        // 在 C 中，callee 既可以是标识符（函数名），也可以是函数指针表达式
+        // 使用translate_expr_rvalue对标识符返回符号表里的全局/局部指针
+        let callee_op = self.translate_expr_rvalue(&call.callee.node, context)?;
+
+        // 获取函数签名信息: callee_op 的类型应该是 Pointer，其 inner 类型应该是 Function
+        let callee_dtype = callee_op.dtype();
+        let func_type = callee_dtype
+            .get_pointer_inner()
+            .and_then(|inner| inner.get_function_inner())
+            .ok_or_else(|| IrgenErrorMessage::NeedFunctionOrFunctionPointer {
+                callee: callee_op.clone(),
+            })?;
+        let (ret_dtype, param_dtypes) = func_type;
+
+        // 处理参数
+        let mut args = Vec::new();
+        for (i, arg_ast) in call.arguments.iter().enumerate() {
+            // 计算参数表达式的右值
+            let arg_op = self.translate_expr_rvalue(&arg_ast.node, context)?;
+            // 隐式转换参数为函数原型对应的参数类型, 超出原型定义的参数简化处理
+            let arg_casted = if let Some(target_dtype) = param_dtypes.get(i) {
+                self.translate_typecast(arg_op, target_dtype.clone(), context)?
+            } else {
+                arg_op
+            };
+            args.push(arg_casted);
+        }
+
+        // 插入call指令
+        context.insert_instruction(ir::Instruction::Call {
+            callee: callee_op,
+            args,
+            return_type: ret_dtype.clone(),
+        })
+    }
+
+    // 3类逻辑：纯算术运算(如-,!,~)、内存操作(&, *)和具有副作用的自增自减(++,--)
+    fn translate_unary_op(
+        &mut self,
+        unary: &UnaryOperatorExpression,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        let op = &unary.operator.node;
+        let operand_ast = &unary.operand.node;
+
+        match op {
+            // 取地址运算符直接返回操作数的左值（即该变量在内存中的地址指针）
+            UnaryOperator::Address => self.translate_expr_lvalue(operand_ast, context),
+            // *(解引用)
+            UnaryOperator::Indirection => {
+                // 先计算操作数的右值（得到一个指针值）
+                let ptr = self.translate_expr_rvalue(operand_ast, context)?;
+                // 确保是指针
+                if ptr.dtype().get_pointer_inner().is_none() {
+                    return Err(IrgenErrorMessage::Misc {
+                        message: "dereferencing a non-pointer value".to_string(),
+                    });
+                }
+                // 从该地址读取数据
+                context.insert_instruction(ir::Instruction::Load { ptr })
+            }
+            // 基础一元算术运算(+ - !)
+            UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::Negate => {
+                let operand = self.translate_expr_rvalue(operand_ast, context)?;
+                context.insert_instruction(ir::Instruction::UnaryOp {
+                    op: op.clone(),
+                    operand: operand.clone(),
+                    dtype: operand.dtype(),
+                })
+            }
+            // 按位取反 (~) 根据IR例子可得通过使用 XOR -1 来实现
+            UnaryOperator::Complement => {
+                let operand = self.translate_expr_rvalue(operand_ast, context)?;
+                let dtype = operand.dtype();
+                let mask = ir::Operand::constant(ir::Constant::int(u128::MAX, dtype.clone()));
+                context.insert_instruction(ir::Instruction::BinOp {
+                    op: BinaryOperator::BitwiseXor,
+                    lhs: operand,
+                    rhs: mask,
+                    dtype,
+                })
+            }
+            // 自增与自减 (++, --) 包括前置和后置
+            UnaryOperator::PreIncrement
+            | UnaryOperator::PreDecrement
+            | UnaryOperator::PostIncrement
+            | UnaryOperator::PostDecrement => {
+                // 获取操作数左值
+                let ptr = self.translate_expr_lvalue(operand_ast, context)?;
+                let dtype = ptr.dtype().get_pointer_inner().unwrap().clone();
+
+                // Load 当前值
+                let old_val =
+                    context.insert_instruction(ir::Instruction::Load { ptr: ptr.clone() })?;
+                //计算新值 val+1 or val-1
+                let is_inc = matches!(
+                    op,
+                    UnaryOperator::PreIncrement | UnaryOperator::PostIncrement
+                );
+                let bin_op = if is_inc {
+                    BinaryOperator::Plus
+                } else {
+                    BinaryOperator::Minus
+                };
+                let one = ir::Operand::constant(ir::Constant::int(1, dtype.clone()));
+
+                let new_val = context.insert_instruction(ir::Instruction::BinOp {
+                    op: bin_op,
+                    lhs: old_val.clone(),
+                    rhs: one,
+                    dtype: dtype.clone(),
+                })?;
+
+                // 将新值存回去
+                let _unused = context.insert_instruction(ir::Instruction::Store {
+                    ptr: ptr.clone(),
+                    value: new_val.clone(),
+                })?;
+
+                // 根据++,--是后缀还是前缀决定返回旧值operand还是新值
+                if matches!(
+                    op,
+                    UnaryOperator::PreDecrement | UnaryOperator::PreIncrement
+                ) {
+                    Ok(new_val)
+                } else {
+                    Ok(old_val)
+                }
+            }
+        }
+    }
+
+    fn translate_binary_op(
+        &mut self,
+        op: BinaryOperator,
+        lhs_ast: &Expression,
+        rhs_ast: &Expression,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        todo!()
     }
 }
 
