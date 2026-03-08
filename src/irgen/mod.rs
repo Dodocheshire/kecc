@@ -39,7 +39,6 @@ use core::convert::TryFrom;
 use core::{fmt, mem, panic};
 use std::collections::{BTreeMap, HashMap, binary_heap};
 use std::ops::Deref;
-use std::{default, u128};
 
 use itertools::izip;
 use lang_c::ast::*;
@@ -47,7 +46,6 @@ use lang_c::driver::Parse;
 use lang_c::span::Node;
 use thiserror::Error;
 
-use crate::asm::Block;
 use crate::ir::{DtypeError, HasDtype, JumpArg, Named};
 use crate::write_base::WriteString;
 use crate::*;
@@ -542,6 +540,7 @@ impl IrgenFunc<'_> {
     }
 
     /// Allocate a new temporary id.
+    /// 可用于命名匿名结构体类型和匿名局部变量，i.e. struct %t1 / %l5:u1:t0
     fn alloc_tempid(&mut self) -> String {
         let tempid = self.tempid_counter;
         self.tempid_counter += 1;
@@ -869,7 +868,7 @@ impl IrgenFunc<'_> {
                 self.insert_block(
                     mem::replace(context, Context::new(bid_end)),
                     ir::BlockExit::Switch {
-                        value: value,
+                        value,
                         default: JumpArg::new(bid_default, vec![]),
                         cases,
                     },
@@ -925,7 +924,7 @@ impl IrgenFunc<'_> {
         }
     }
 
-    // 检查声明类型，local allocation，必要时初始化变量(store)
+    // 检查声明类型，local allocation，必要时初始化变量
     fn translate_declaration(
         &mut self,
         decl: &Declaration,
@@ -943,9 +942,10 @@ impl IrgenFunc<'_> {
         // 函数内部不支持typedef
         assert!(!is_typedef);
         // 函数内部不支持定义结构体类型。检查结构体类型是否已被定义(使用辅助函数is_invalid_structure)
+        // todo: 考虑函数体中匿名结构体的情况
         if is_invalid_structure(&base_dtype, self.structs) {
             return Err(IrgenErrorMessage::Misc {
-                message: format!("{} has incomplete type!", base_dtype),
+                message: format!("{} has incomplete type or is anonymous struct", base_dtype),
             });
         }
 
@@ -967,40 +967,133 @@ impl IrgenFunc<'_> {
                 .resolve_typedefs(self.typedefs)
                 .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
 
-            // translate initializer并根据其返回的operand初始化变量var
-            match &dtype {
-                ir::Dtype::Unit { .. } => todo!(),
-                ir::Dtype::Int { .. }
-                | ir::Dtype::Float { .. }
-                | ir::Dtype::Pointer { .. }
-                | ir::Dtype::Array { .. } => {
-                    let value = if let Some(initializer) = &init_decl.node.initializer {
-                        Some(self.translate_initializer(&initializer.node, context)?)
-                    } else {
-                        None
-                    };
-                    let _unused =
-                        self.translate_alloc(var.clone(), dtype.clone(), value, context)?;
-                }
-                ir::Dtype::Function { .. } => todo!(),
-                ir::Dtype::Typedef { .. } => {
-                    panic!("typedef should be reduced to real types");
-                }
-                ir::Dtype::Struct { .. } => todo!(),
+            // 栈上分配内存
+            let ptr_reg = self.insert_alloc(Named::new(Some(var.clone()), dtype.clone()));
+            let ptr_operand = ir::Operand::register(ptr_reg, ir::Dtype::pointer(dtype.clone()));
+
+            // 将变量存入符号表，此时映射的是它的地址指针
+            self.insert_symbol_table_entry(var.clone(), ptr_operand.clone())?;
+
+            // 处理初始化逻辑
+            if let Some(initializer) = &init_decl.node.initializer {
+                self.translate_initializer_recursive(
+                    &ptr_operand,
+                    &dtype,
+                    &initializer.node,
+                    context,
+                )?;
             }
         }
         Ok(())
     }
 
-    fn translate_initializer(
+    // hard
+    fn translate_initializer_recursive(
         &mut self,
+        ptr: &ir::Operand, // 当前要写入的内存地址 (Pointer Operand)
+        dtype: &ir::Dtype, // 当前地址对应的 Dtype
         initializer: &Initializer,
         context: &mut Context,
-    ) -> Result<ir::Operand, IrgenErrorMessage> {
+    ) -> Result<(), IrgenErrorMessage> {
         match initializer {
-            Initializer::Expression(expr) => self.translate_expr_rvalue(&expr.node, context),
-            Initializer::List(_) => panic!("Initializer::List is unsupported"), // 重点，{1, 2, 3},{.a = init, .b = init2}这种形式的初始化暂时不支持，因为比较复杂
+            Initializer::Expression(expr) => {
+                let val_op = self.translate_expr_rvalue(&expr.node, context)?;
+                // implicit typecast
+                let val_casted = self.translate_typecast(val_op, dtype.clone(), context)?;
+                let _unused = context.insert_instruction(ir::Instruction::Store {
+                    // 结构体类型也能一条Store IR完成
+                    ptr: ptr.clone(),
+                    value: val_casted,
+                })?;
+            }
+            // 列表初始化（例如 {1, 2, {3, 4}}）
+            Initializer::List(items) => {
+                match dtype {
+                    // 数组初始化 [N x T]
+                    ir::Dtype::Array { inner, size } => {
+                        // 先将 [N x T]* 转换为 T* 用于计算偏移
+                        let element_ptr_base =
+                            context.insert_instruction(ir::Instruction::GetElementPtr {
+                                ptr: ptr.clone(),
+                                offset: ir::Operand::constant(ir::Constant::int(
+                                    0,
+                                    ir::Dtype::LONG,
+                                )),
+                                dtype: ir::Dtype::pointer(inner.deref().clone()),
+                            })?;
+                        let (elem_size, _) = inner.size_align_of(&self.structs).unwrap();
+
+                        for (i, item) in items.iter().enumerate() {
+                            // 赋值截断至前size个元素(防止超过数组大小)
+                            if i >= *size {
+                                break;
+                            }
+                            // 计算当前元素地址：element_ptr = base + i * sizeof(T)
+                            let byte_offset = (i * elem_size) as u128;
+                            let element_ptr =
+                                context.insert_instruction(ir::Instruction::GetElementPtr {
+                                    ptr: element_ptr_base.clone(),
+                                    offset: ir::Operand::constant(ir::Constant::int(
+                                        byte_offset,
+                                        ir::Dtype::LONG,
+                                    )),
+                                    dtype: ir::Dtype::pointer(inner.deref().clone()),
+                                })?;
+                            // 递归初始化子元素
+                            // 这里忽略每个InitializerListItem的designation字段，即假设{.a = ..., .b[1] = ...}这种委派不存在
+                            self.translate_initializer_recursive(
+                                &element_ptr,
+                                inner.deref(),
+                                &item.node.initializer.node,
+                                context,
+                            )?;
+                        }
+                    }
+                    ir::Dtype::Struct { name, .. } => {
+                        let struct_name = name.as_ref().expect("Struct must have a name");
+                        // 结构体类型必须预先定义过
+                        let struct_def = self.structs.get(struct_name).unwrap().as_ref().unwrap();
+                        // 获取字段列表和预先计算好的偏移量
+                        // 该Dtype必须是结构体，且字段定义非空
+                        let fields = struct_def.get_struct_fields().unwrap().as_ref().unwrap();
+                        let (_, _, offsets) = struct_def
+                            .get_struct_size_align_offsets()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap();
+
+                        for (field, &offset, item) in izip!(fields, offsets, items) {
+                            let field_dtype = field.deref();
+                            // 计算字段地址: field_ptr = struct_ptr + offset
+                            let field_ptr =
+                                context.insert_instruction(ir::Instruction::GetElementPtr {
+                                    ptr: ptr.clone(), // struct pointer
+                                    offset: ir::Operand::constant(ir::Constant::int(
+                                        offset as u128,
+                                        ir::Dtype::LONG,
+                                    )),
+                                    dtype: ir::Dtype::pointer(field_dtype.clone()),
+                                })?;
+
+                            // 递归初始化字段
+                            self.translate_initializer_recursive(
+                                &field_ptr,
+                                field_dtype,
+                                &item.node.initializer.node,
+                                context,
+                            )?;
+                        }
+                    }
+                    _ => {
+                        return Err(IrgenErrorMessage::Misc {
+                            message: "Initializer List for non-aggregate type".to_string(),
+                        });
+                    }
+                }
+            }
         }
+
+        Ok(())
     }
 
     fn translate_expr_rvalue(
@@ -1026,7 +1119,7 @@ impl IrgenFunc<'_> {
                     // we convert array into pointer
                     return self.convert_array_to_pointer(ptr, array_inner.clone(), context);
                 }
-                context.insert_instruction(ir::Instruction::Load { ptr })
+                context.insert_instruction(ir::Instruction::Load { ptr }) // 注意Struct是可以直接一条IR Load的
             }
             Expression::Constant(constant) => {
                 let constant = ir::Constant::try_from(&constant.node)
@@ -1038,44 +1131,12 @@ impl IrgenFunc<'_> {
             }
             Expression::GenericSelection(_) => panic!("Expression::GenericSelection not supported"),
             Expression::Member(member) => {
-                // hard
-                // 计算成员所属对象的起始地址
-                let base_ptr = match member.node.operator.node {
-                    MemberOperator::Direct => {
-                        // a.b -> 先获取a的左值(地址)
-                        self.translate_expr_lvalue(&member.node.expression.node, context)?
-                    }
-                    MemberOperator::Indirect => {
-                        // a->b -> 先获取a的右值(隐含a是个指针)
-                        self.translate_expr_rvalue(&member.node.expression.node, context)?
-                    }
-                };
-
-                let base_dtype = base_ptr.dtype();
-                let struct_dtype =
-                    base_dtype
-                        .get_pointer_inner()
-                        .ok_or_else(|| IrgenErrorMessage::Misc {
-                            message: "member access on non-pointer type".to_string(),
-                        })?;
-                // 在结构体定义中查找字段的偏移量和类型
-                // 这里利用Dtype方法get_offset_struct_field
-                let field_name = &member.node.identifier.node.name;
-                let (offset, field_dtype) = struct_dtype
-                    .get_offset_struct_field(field_name, &self.structs)
-                    .ok_or_else(|| IrgenErrorMessage::Misc {
-                        message: format!("field {} not found in struct", field_name),
-                    })?;
-
-                // 使用GetElementPtr计算字段地址
-                let field_ptr = context.insert_instruction(ir::Instruction::GetElementPtr {
-                    ptr: base_ptr,
-                    offset: ir::Operand::constant(ir::Constant::int(
-                        offset as u128,
-                        ir::Dtype::LONG,
-                    )),
-                    dtype: ir::Dtype::pointer(field_dtype.clone()),
-                })?;
+                let (field_ptr, field_dtype) = self.translate_member_expr_lvalue(
+                    &member.node.operator.node,
+                    &member.node.expression.node,
+                    &member.node.identifier.node,
+                    context,
+                )?;
 
                 // 如果该字段是数组类型，例如a.b中b是一个数组[i32 x 5],那么该字段作为右值退化成首元素的指针
                 // 函数则直接返回指向函数的指针
@@ -1085,7 +1146,7 @@ impl IrgenFunc<'_> {
                 } else if field_dtype.get_function_inner().is_some() {
                     Ok(field_ptr)
                 } else {
-                    context.insert_instruction(ir::Instruction::Load { ptr: field_ptr })
+                    context.insert_instruction(ir::Instruction::Load { ptr: field_ptr }) // 注意如果字段是结构体也是可以直接用一条IR Load的
                 }
             }
             Expression::Call(call) => self.translate_func_call(&call.node, context),
@@ -1173,7 +1234,57 @@ impl IrgenFunc<'_> {
         expr: &Expression,
         context: &mut Context,
     ) -> Result<ir::Operand, IrgenErrorMessage> {
-        todo!()
+        match expr {
+            Expression::Identifier(id) => self.lookup_symbol_table(&id.node.name),
+            Expression::UnaryOperator(unary) => match &unary.node.operator.node {
+                // 只允许解引用(*)做左值
+                UnaryOperator::Indirection => {
+                    // *a 的左值就是a(指针)
+                    self.translate_expr_rvalue(&unary.node.operand.node, context)
+                }
+                _ => Err(IrgenErrorMessage::Misc {
+                    message: "This error occured at `IrgenFunc::translate_expr_lvalue`".to_string(),
+                }),
+            },
+            Expression::BinaryOperator(binary) => match &binary.node.operator.node {
+                // 只允许索引([])当左值
+                BinaryOperator::Index => self.translate_index_op_lvalue(
+                    &binary.node.lhs.node,
+                    &binary.node.rhs.node,
+                    context,
+                ),
+                _ => Err(IrgenErrorMessage::Misc {
+                    message: "binary operator expression cannot be used as l-value except \
+                                index operator expression"
+                        .to_string(),
+                }),
+            },
+            Expression::StringLiteral(_string_lit) => todo!(),
+            Expression::Member(member) => {
+                // 如果 a.b 是一个 int[10]，它返回 (int[10])*
+                // 如果 a.b 是一个函数，它返回 (function_type)* 不需要特殊处理
+                let (field_ptr, _field_dtype) = self.translate_member_expr_lvalue(
+                    &member.node.operator.node,
+                    &member.node.expression.node,
+                    &member.node.identifier.node,
+                    context,
+                )?;
+
+                Ok(field_ptr)
+            }
+            Expression::Conditional(_)
+            | Expression::Constant(_)
+            | Expression::Call(_)
+            | Expression::Comma(_)
+            | Expression::SizeOfTy(_)
+            | Expression::SizeOfVal(_)
+            | Expression::AlignOf(_)
+            | Expression::GenericSelection(_)
+            | Expression::Cast(_) => Err(IrgenErrorMessage::Misc {
+                message: "This error occured at `IrgenFunc::translate_expr_lvalue`".to_string(),
+            }),
+            _ => panic!("is unsupported"),
+        }
     }
 
     fn lookup_symbol_table(&self, name: &str) -> Result<ir::Operand, IrgenErrorMessage> {
@@ -1572,7 +1683,8 @@ impl IrgenFunc<'_> {
         let res_dtype = v_then.dtype();
 
         // 在函数栈上分配临时空间用来存放三元运算的结果
-        let tmp_reg = self.insert_alloc(Named::new(None, res_dtype.clone()));
+        let tmp_name = self.alloc_tempid();
+        let tmp_reg = self.insert_alloc(Named::new(Some(tmp_name), res_dtype.clone()));
         let tmp_ptr = ir::Operand::register(tmp_reg, res_dtype.clone());
         // 将 Then 的结果存入临时空间
         let _unused = context.insert_instruction(ir::Instruction::Store {
@@ -1752,7 +1864,266 @@ impl IrgenFunc<'_> {
         rhs_ast: &Expression,
         context: &mut Context,
     ) -> Result<ir::Operand, IrgenErrorMessage> {
-        todo!()
+        match op {
+            // a[i] equiv to *(a + i),使用GetElementPtr指令
+            BinaryOperator::Index => {
+                let element_ptr = self.translate_index_op_lvalue(lhs_ast, rhs_ast, context)?;
+                // 作为右值，需要Load
+                context.insert_instruction(ir::Instruction::Load { ptr: element_ptr })
+            }
+            // 普通算术和比较运算
+            BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+            | BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::ShiftLeft
+            | BinaryOperator::ShiftRight
+            | BinaryOperator::Less
+            | BinaryOperator::LessOrEqual
+            | BinaryOperator::Greater
+            | BinaryOperator::GreaterOrEqual
+            | BinaryOperator::Equals
+            | BinaryOperator::NotEquals
+            | BinaryOperator::BitwiseAnd
+            | BinaryOperator::BitwiseXor
+            | BinaryOperator::BitwiseOr => {
+                let lhs = self.translate_expr_rvalue(lhs_ast, context)?;
+                let rhs = self.translate_expr_rvalue(rhs_ast, context)?;
+                let rhs = self.translate_typecast(rhs, lhs.dtype(), context)?;
+                // 确定结果类型，如果是比较运算，返回i1(BOOL)
+                let res_dtype = if matches!(
+                    op,
+                    BinaryOperator::Less
+                        | BinaryOperator::LessOrEqual
+                        | BinaryOperator::Greater
+                        | BinaryOperator::GreaterOrEqual
+                        | BinaryOperator::Equals
+                        | BinaryOperator::NotEquals
+                ) {
+                    ir::Dtype::BOOL
+                } else {
+                    lhs.dtype()
+                };
+
+                context.insert_instruction(ir::Instruction::BinOp {
+                    op,
+                    lhs,
+                    rhs,
+                    dtype: res_dtype,
+                })
+            }
+            // 逻辑运算符,处理短路
+            BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => {
+                self.translate_logical_op(op.clone(), lhs_ast, rhs_ast, context)
+            }
+            BinaryOperator::Assign => {
+                let ptr = self.translate_expr_lvalue(lhs_ast, context)?;
+                let dtype = ptr
+                    .dtype()
+                    .get_pointer_inner()
+                    .ok_or_else(|| IrgenErrorMessage::Misc {
+                        message: "Trying to Deref a non-pointer type".to_string(),
+                    })?
+                    .clone();
+                let val = self.translate_expr_rvalue(rhs_ast, context)?;
+                let val = self.translate_typecast(val, dtype, context)?;
+                let _unused = context.insert_instruction(ir::Instruction::Store {
+                    ptr: ptr.clone(),
+                    value: val.clone(),
+                })?;
+                Ok(val) // 赋值表达式的值是赋值后的值
+            }
+            // 复合赋值运算(+= *= %= <<= ^=等)
+            _ => {
+                let ptr = self.translate_expr_lvalue(lhs_ast, context)?;
+                let dtype = ptr
+                    .dtype()
+                    .get_pointer_inner()
+                    .ok_or_else(|| IrgenErrorMessage::Misc {
+                        message: "Trying to Deref a non-pointer type".to_string(),
+                    })?
+                    .clone();
+
+                // a. load当前值
+                let current_val =
+                    context.insert_instruction(ir::Instruction::Load { ptr: ptr.clone() })?;
+                // b. 计算右值
+                let rhs_val = self.translate_expr_rvalue(rhs_ast, context)?;
+                // 提取基础算术运算符
+                let base_op = match op {
+                    BinaryOperator::AssignPlus => BinaryOperator::Plus,
+                    BinaryOperator::AssignMinus => BinaryOperator::Minus,
+                    BinaryOperator::AssignMultiply => BinaryOperator::Multiply,
+                    BinaryOperator::AssignDivide => BinaryOperator::Divide,
+                    BinaryOperator::AssignModulo => BinaryOperator::Modulo,
+                    BinaryOperator::AssignShiftLeft => BinaryOperator::ShiftLeft,
+                    BinaryOperator::AssignShiftRight => BinaryOperator::ShiftRight,
+                    BinaryOperator::AssignBitwiseAnd => BinaryOperator::BitwiseAnd,
+                    BinaryOperator::AssignBitwiseXor => BinaryOperator::BitwiseXor,
+                    BinaryOperator::AssignBitwiseOr => BinaryOperator::BitwiseOr,
+                    _ => unreachable!(),
+                };
+                //c. typecast并运算
+                let rhs_val = self.translate_typecast(rhs_val, dtype.clone(), context)?;
+                let result = context.insert_instruction(ir::Instruction::BinOp {
+                    op: base_op,
+                    lhs: current_val,
+                    rhs: rhs_val,
+                    dtype: dtype.clone(),
+                })?;
+
+                //d. store
+                let _unused = context.insert_instruction(ir::Instruction::Store {
+                    ptr: ptr.clone(),
+                    value: result.clone(),
+                })?;
+
+                Ok(result)
+            }
+        }
+    }
+
+    // translate a[i] as lvalue
+    fn translate_index_op_lvalue(
+        &mut self,
+        lhs_ast: &Expression,
+        rhs_ast: &Expression,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        let base = self.translate_expr_rvalue(lhs_ast, context)?;
+        let index = self.translate_expr_rvalue(rhs_ast, context)?;
+
+        let inner_type = base
+            .dtype()
+            .get_pointer_inner()
+            .ok_or_else(|| IrgenErrorMessage::Misc {
+                message: "indexing non-pointer type".to_string(),
+            })?
+            .clone();
+        let (size, _) = inner_type
+            .size_align_of(&self.structs)
+            .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+        let size = ir::Operand::constant(ir::Constant::int(size as u128, ir::Dtype::LONG));
+
+        // 计算byte 偏移量
+        let offset = context.insert_instruction(ir::Instruction::BinOp {
+            op: BinaryOperator::Multiply,
+            lhs: index,
+            rhs: size,
+            dtype: ir::Dtype::LONG,
+        })?;
+        let element_ptr = context.insert_instruction(ir::Instruction::GetElementPtr {
+            ptr: base,
+            offset,
+            dtype: ir::Dtype::pointer(inner_type.clone()),
+        })?;
+
+        Ok(element_ptr)
+    }
+    fn translate_logical_op(
+        &mut self,
+        op: BinaryOperator,
+        lhs_ast: &Expression,
+        rhs_ast: &Expression,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        let op_result = self.alloc_tempid();
+        let local_id = self.insert_alloc(Named::new(Some(op_result), ir::Dtype::BOOL));
+        let result_ptr = ir::Operand::register(local_id, ir::Dtype::pointer(ir::Dtype::BOOL));
+
+        let else_bid = self.alloc_bid(); // 对lhs_ast估值后再对rhs_ast 估值
+        let then_bid = self.alloc_bid(); // 对lhs_ast估值后不再对rhs_ast估值，而是store lhs的结果到op_result
+        let end_bid = self.alloc_bid(); // 从局部临时变量中load结果作为logical operation的最终结果
+
+        let (tgt_true, tgt_false) = if matches!(op, BinaryOperator::LogicalAnd) {
+            // lhs_ast估值为真，跳转到tgt_true block
+            (else_bid, then_bid)
+        } else {
+            (then_bid, else_bid)
+        };
+
+        let lhs = self.translate_condition(lhs_ast, context)?;
+        self.insert_block(
+            mem::replace(context, Context::new(then_bid)),
+            ir::BlockExit::ConditionalJump {
+                condition: lhs.clone(),
+                arg_then: JumpArg::new(tgt_true, vec![]),
+                arg_else: JumpArg::new(tgt_false, vec![]),
+            },
+        );
+
+        // store lhs into result_ptr(temp allocation)
+        let _unused = context.insert_instruction(ir::Instruction::Store {
+            ptr: result_ptr.clone(),
+            value: lhs,
+        })?;
+        self.insert_block(
+            mem::replace(context, Context::new(else_bid)),
+            ir::BlockExit::Jump {
+                arg: JumpArg::new(end_bid, vec![]),
+            },
+        );
+
+        // translate else_bid block(rhs_ast)
+        let rhs = self.translate_condition(rhs_ast, context)?;
+        let _unused = context.insert_instruction(ir::Instruction::Store {
+            ptr: result_ptr.clone(),
+            value: rhs,
+        })?;
+        self.insert_block(
+            mem::replace(context, Context::new(end_bid)),
+            ir::BlockExit::Jump {
+                arg: JumpArg::new(end_bid, vec![]),
+            },
+        );
+
+        // load `result_ptr` in end_bid block
+        context.insert_instruction(ir::Instruction::Load { ptr: result_ptr })
+    }
+
+    fn translate_member_expr_lvalue(
+        &mut self,
+        op: &MemberOperator,
+        expr: &Expression,
+        member: &Identifier,
+        context: &mut Context,
+    ) -> Result<(ir::Operand, ir::Dtype), IrgenErrorMessage> {
+        let base_ptr = match op {
+            MemberOperator::Direct => {
+                // a.b -> 先获取a的左值(地址)
+                self.translate_expr_lvalue(expr, context)?
+            }
+            MemberOperator::Indirect => {
+                // a->b -> 先获取a的右值(隐含a是个指针)
+                self.translate_expr_rvalue(expr, context)?
+            }
+        };
+
+        let base_dtype = base_ptr.dtype();
+        let struct_dtype =
+            base_dtype
+                .get_pointer_inner()
+                .ok_or_else(|| IrgenErrorMessage::Misc {
+                    message: "member access on non-pointer type".to_string(),
+                })?;
+        // 在结构体定义中查找字段的偏移量和类型
+        // 这里利用Dtype方法get_offset_struct_field
+        let field_name = &member.name;
+        let (offset, field_dtype) = struct_dtype
+            .get_offset_struct_field(field_name, &self.structs)
+            .ok_or_else(|| IrgenErrorMessage::Misc {
+                message: format!("field {} not found in struct", field_name),
+            })?;
+
+        // 使用GetElementPtr计算字段地址
+        let field_ptr = context.insert_instruction(ir::Instruction::GetElementPtr {
+            ptr: base_ptr,
+            offset: ir::Operand::constant(ir::Constant::int(offset as u128, ir::Dtype::LONG)),
+            dtype: ir::Dtype::pointer(field_dtype.clone()),
+        })?;
+
+        Ok((field_ptr, field_dtype))
     }
 }
 
@@ -1853,6 +2224,7 @@ fn is_valid_initializer(
                     .expect("`fields` must be `Some`");
 
                 izip!(fields, items).all(|(f, i)| {
+                    // 这里不考虑designation的存在
                     is_valid_initializer(&i.node.initializer.node, f.deref(), structs)
                 })
             }
