@@ -116,7 +116,10 @@ fn test_examples_irgen_small() {
         }
     });
 }
-
+#[test]
+fn test_temp2() {
+    test_irgen(Path::new("examples/c/temp2.c"));
+}
 #[test]
 fn test_examples_irgen_large() {
     test_dir(Path::new("examples/c"), OsStr::new("c"), |path| {

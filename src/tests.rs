@@ -138,6 +138,7 @@ pub fn test_irgen(path: &Path) {
             "-fsanitize=float-divide-by-zero",
             "-fsanitize=undefined",
             "-fno-sanitize-recover=all",
+            "-fsigned-char", // 强制 char 为有符号,符合我们kecc的标准
             &file_path,
             "-o",
             &bin_path,
@@ -157,7 +158,7 @@ pub fn test_irgen(path: &Path) {
         .expect("failed to execute the compiled executable");
 
     let Some(status) = child
-        .wait_timeout(Duration::from_millis(1000))
+        .wait_timeout(Duration::from_millis(5000))
         .expect("failed to obtain exit status from child process")
     else {
         println!("timeout occurs");

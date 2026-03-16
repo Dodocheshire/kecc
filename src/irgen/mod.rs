@@ -37,16 +37,19 @@
 use core::cmp::Ordering;
 use core::convert::TryFrom;
 use core::{fmt, mem, panic};
-use std::collections::{BTreeMap, HashMap, binary_heap};
+use std::any::Any;
+use std::collections::{BTreeMap, HashMap};
+use std::io::empty;
 use std::ops::Deref;
 
 use itertools::izip;
 use lang_c::ast::*;
 use lang_c::driver::Parse;
 use lang_c::span::Node;
+use rand::seq::index;
 use thiserror::Error;
 
-use crate::ir::{DtypeError, HasDtype, JumpArg, Named};
+use crate::ir::{DtypeError, HasDtype, JumpArg, Named, Operand};
 use crate::write_base::WriteString;
 use crate::*;
 
@@ -863,7 +866,7 @@ impl IrgenFunc<'_> {
                     .map_err(|e| IrgenError::new(stmt.node.expression.node.write_string(), e))?;
                 let bid_end = self.alloc_bid();
                 let (cases, bid_default) =
-                    self.translate_switch_body(&stmt.node.statement.node, bid_end)?; // 这里不影响context
+                    self.translate_switch_body(&stmt.node.statement.node, bid_end, bid_continue)?; // 这里不影响当前context
 
                 self.insert_block(
                     mem::replace(context, Context::new(bid_end)),
@@ -1021,7 +1024,7 @@ impl IrgenFunc<'_> {
                                 )),
                                 dtype: ir::Dtype::pointer(inner.deref().clone()),
                             })?;
-                        let (elem_size, _) = inner.size_align_of(&self.structs).unwrap();
+                        let (elem_size, _) = inner.size_align_of(self.structs).unwrap();
 
                         for (i, item) in items.iter().enumerate() {
                             // 赋值截断至前size个元素(防止超过数组大小)
@@ -1131,22 +1134,59 @@ impl IrgenFunc<'_> {
             }
             Expression::GenericSelection(_) => panic!("Expression::GenericSelection not supported"),
             Expression::Member(member) => {
-                let (field_ptr, field_dtype) = self.translate_member_expr_lvalue(
-                    &member.node.operator.node,
-                    &member.node.expression.node,
-                    &member.node.identifier.node,
+                let base_ptr = match member.node.operator.node {
+                    // a.b
+                    // pretty hard
+                    MemberOperator::Direct => {
+                        // 首先尝试获取左值地址 (适用于普通变量如 a.b)
+                        match self.translate_expr_lvalue(&member.node.expression.node, context) {
+                            Ok(ptr) => ptr,
+                            Err(_) => {
+                                // 如果获取左值失败 (例如 f().x 中的 f() 是右值,不能获取左值)
+                                // 1. 计算右值 (会生成 call 指令并返回结构体本身)
+                                let rval = self
+                                    .translate_expr_rvalue(&member.node.expression.node, context)?;
+                                let dtype = rval.dtype();
+
+                                // 2. 在栈上分配一个临时变量来存放返回的结构体
+                                let temp_name = self.alloc_tempid();
+                                let temp_reg =
+                                    self.insert_alloc(Named::new(Some(temp_name), dtype.clone()));
+                                let temp_ptr =
+                                    ir::Operand::register(temp_reg, ir::Dtype::pointer(dtype));
+
+                                // 3. 将结构体 Store 进去
+                                let _unused =
+                                    context.insert_instruction(ir::Instruction::Store {
+                                        ptr: temp_ptr.clone(),
+                                        value: rval,
+                                    })?;
+
+                                // 4. 返回这个临时变量的地址作为后续 GEP 的基址
+                                temp_ptr
+                            }
+                        }
+                    }
+
+                    // a->b 本身就隐含 a 是指针 (右值)
+                    MemberOperator::Indirect => {
+                        self.translate_expr_rvalue(&member.node.expression.node, context)?
+                    }
+                };
+
+                let (field_ptr, field_dtype) = self.get_struct_field_ptr(
+                    base_ptr,
+                    &member.node.identifier.node.name,
                     context,
                 )?;
 
-                // 如果该字段是数组类型，例如a.b中b是一个数组[i32 x 5],那么该字段作为右值退化成首元素的指针
-                // 函数则直接返回指向函数的指针
-                // 否则load
+                // 处理数组/函数的右值退化
                 if let Some(array_inner) = field_dtype.get_array_inner() {
                     self.convert_array_to_pointer(field_ptr, array_inner.clone(), context)
                 } else if field_dtype.get_function_inner().is_some() {
                     Ok(field_ptr)
                 } else {
-                    context.insert_instruction(ir::Instruction::Load { ptr: field_ptr }) // 注意如果字段是结构体也是可以直接用一条IR Load的
+                    context.insert_instruction(ir::Instruction::Load { ptr: field_ptr })
                 }
             }
             Expression::Call(call) => self.translate_func_call(&call.node, context),
@@ -1155,11 +1195,11 @@ impl IrgenFunc<'_> {
                 let dtype = ir::Dtype::try_from(&sz_ty.node.0.node)
                     .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
                 let dtype = dtype
-                    .resolve_typedefs(&self.typedefs)
+                    .resolve_typedefs(self.typedefs)
                     .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
 
                 let (size, _) = dtype
-                    .size_align_of(&self.structs)
+                    .size_align_of(self.structs)
                     .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
 
                 Ok(ir::Operand::constant(ir::Constant::int(
@@ -1169,12 +1209,11 @@ impl IrgenFunc<'_> {
             }
             Expression::SizeOfVal(sz_val) => {
                 // sizeof(expr) -> 在 C 中表达式不求值，只需知道其类型
-                // 这里我们通过临时翻译来获取表达式结果的Dtype(todo: 如何消除临时翻译过程中可能的副作用)
-                let operand = self.translate_expr_rvalue(&sz_val.node.0.node, context)?;
+                // 为防止产生副作用我们使用辅助函数get_expr_dtype
+                let operand = self.get_expr_dtype(&sz_val.node.0.node)?;
 
                 let (size, _) = operand
-                    .dtype()
-                    .size_align_of(&self.structs)
+                    .size_align_of(self.structs)
                     .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
 
                 Ok(ir::Operand::constant(ir::Constant::int(
@@ -1186,10 +1225,10 @@ impl IrgenFunc<'_> {
                 let dtype = ir::Dtype::try_from(&typename.node.0.node)
                     .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
                 let dtype = dtype
-                    .resolve_typedefs(&self.typedefs)
+                    .resolve_typedefs(self.typedefs)
                     .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
                 let (_, align_of) = dtype
-                    .size_align_of(&self.structs)
+                    .size_align_of(self.structs)
                     .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
                 Ok(ir::Operand::constant(ir::Constant::int(
                     align_of as u128,
@@ -1201,7 +1240,7 @@ impl IrgenFunc<'_> {
                 let tgt_dtype = ir::Dtype::try_from(&cast.node.type_name.node)
                     .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
                 let tgt_dtype = tgt_dtype
-                    .resolve_typedefs(&self.typedefs)
+                    .resolve_typedefs(self.typedefs)
                     .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
                 let operand = self.translate_expr_rvalue(&cast.node.expression.node, context)?;
                 self.translate_typecast(operand, tgt_dtype, context)
@@ -1229,6 +1268,198 @@ impl IrgenFunc<'_> {
         }
     }
 
+    // 为了让array: [10 x i64] sizeof(array) = 80,不应该自动退化数组,处理a[i]类型时应分别考虑a是纯指针和数组的情况
+    fn get_expr_dtype(&self, expr: &Expression) -> Result<ir::Dtype, IrgenErrorMessage> {
+        match expr {
+            Expression::Identifier(id) => {
+                let ptr = self.lookup_symbol_table(&id.node.name)?;
+                let ptr_inner = ptr
+                    .dtype()
+                    .get_pointer_inner()
+                    .ok_or_else(|| panic!("Symbol table operand must be pointer"))?
+                    .clone(); // 注意global variable(ir::Operand::Constant)的dtype也是ir::Dtype::Pointer
+
+                if ptr_inner.get_function_inner().is_some() {
+                    Ok(ptr.dtype()) // 函数退化->函数指针？
+                } else {
+                    Ok(ptr_inner)
+                }
+            }
+            Expression::Constant(c) => {
+                let constant =
+                    ir::Constant::try_from(&c.node).map_err(|_| IrgenErrorMessage::Misc {
+                        message: "Invalid Constant".to_string(),
+                    })?;
+                Ok(constant.dtype())
+            }
+            Expression::UnaryOperator(unary) => match unary.node.operator.node {
+                UnaryOperator::Address => {
+                    let inner = self.get_expr_dtype(&unary.node.operand.node)?;
+                    Ok(ir::Dtype::pointer(inner))
+                }
+                UnaryOperator::Indirection => {
+                    let inner = self.get_expr_dtype(&unary.node.operand.node)?;
+                    let deref_type = inner
+                        .get_pointer_inner()
+                        .ok_or_else(|| IrgenErrorMessage::Misc {
+                            message: "Deref non-pointer type".to_string(), // 假设不允许对数组a解引用: `*a`
+                        })?
+                        .clone();
+                    Ok(deref_type)
+                }
+                UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::Complement => {
+                    Ok(self.integer_promote_type(self.get_expr_dtype(&unary.node.operand.node)?))
+                }
+                // C11 6.5.3.3: 逻辑非的结果类型是 int
+                UnaryOperator::Negate => Ok(ir::Dtype::INT),
+
+                // ++, --, 不改变基础类型
+                _ => self.get_expr_dtype(&unary.node.operand.node),
+            },
+            Expression::BinaryOperator(binary) => {
+                match binary.node.operator.node {
+                    // // C11 6.5.8 & 6.5.9: 关系和相等运算的结果类型是 int(只是IR生成逻辑中为了方便br指令跳转将比较运算的结果设为了i1)
+                    BinaryOperator::Equals
+                    | BinaryOperator::NotEquals
+                    | BinaryOperator::Less
+                    | BinaryOperator::LessOrEqual
+                    | BinaryOperator::Greater
+                    | BinaryOperator::GreaterOrEqual => Ok(ir::Dtype::INT),
+
+                    // 逻辑运算结果（包括negate `!`)也是类型是 int
+                    BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => Ok(ir::Dtype::INT),
+
+                    BinaryOperator::Index => {
+                        let base_type = self.get_expr_dtype(&binary.node.lhs.node)?;
+                        match base_type {
+                            ir::Dtype::Array { inner, .. } | ir::Dtype::Pointer { inner, .. } => {
+                                Ok(inner.deref().clone())
+                            }
+                            _ => Err(IrgenErrorMessage::Misc {
+                                message: "attempt to index a type that isn't array or pointer"
+                                    .to_string(),
+                            }),
+                        }
+                    }
+                    // 赋值表达式的类型就是左操作数的类型
+                    BinaryOperator::Assign
+                    | BinaryOperator::AssignPlus
+                    | BinaryOperator::AssignMinus
+                    | BinaryOperator::AssignMultiply
+                    | BinaryOperator::AssignDivide
+                    | BinaryOperator::AssignModulo
+                    | BinaryOperator::AssignShiftLeft
+                    | BinaryOperator::AssignShiftRight
+                    | BinaryOperator::AssignBitwiseAnd
+                    | BinaryOperator::AssignBitwiseXor
+                    | BinaryOperator::AssignBitwiseOr => self.get_expr_dtype(&binary.node.lhs.node),
+                    // 算术运算 (+, -, *, /, %, &, |, ^, <<, >>)
+                    _ => {
+                        let lhs_type = self.get_expr_dtype(&binary.node.lhs.node)?;
+                        let rhs_type = self.get_expr_dtype(&binary.node.rhs.node)?;
+
+                        // 应用算术转换逻辑
+                        Ok(self.get_common_type(lhs_type, rhs_type))
+                    }
+                }
+            }
+            Expression::Cast(cast) => {
+                let dtype = ir::Dtype::try_from(&cast.node.type_name.node)
+                    .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+                dtype
+                    .resolve_typedefs(self.typedefs)
+                    .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })
+            }
+            Expression::Call(call) => {
+                let func_ptr = self.get_expr_dtype(&call.node.callee.node)?;
+                let func_type = func_ptr.get_pointer_inner().unwrap();
+                let (ret, _) =
+                    func_type
+                        .get_function_inner()
+                        .ok_or_else(|| IrgenErrorMessage::Misc {
+                            message: "callee is not a function".to_string(),
+                        })?;
+                Ok(ret.clone())
+            }
+            Expression::Member(member) => {
+                let base_type = self.get_expr_dtype(&member.node.expression.node)?;
+                let struct_type = if matches!(member.node.operator.node, MemberOperator::Indirect) {
+                    base_type.get_pointer_inner().unwrap().clone()
+                } else {
+                    base_type.clone()
+                };
+                let field_name = &member.node.identifier.node.name;
+                let (_, field_dtype) = struct_type
+                    .get_offset_struct_field(field_name, self.structs)
+                    .ok_or_else(|| IrgenErrorMessage::Misc {
+                        message: format!("Field {} not found or Dtype is not `struct`", field_name),
+                    })?;
+
+                // 同样处理退化
+                if let Some(array_inner) = field_dtype.get_array_inner() {
+                    Ok(ir::Dtype::pointer(array_inner.clone()))
+                } else if field_dtype.get_function_inner().is_some() {
+                    Ok(ir::Dtype::pointer(field_dtype.clone()))
+                } else {
+                    Ok(field_dtype.clone())
+                }
+            }
+            Expression::Comma(exprs) => {
+                let last_expr = exprs.last().ok_or_else(|| IrgenErrorMessage::Misc {
+                    message: "empty comma expression".into(),
+                })?;
+                self.get_expr_dtype(&last_expr.node)
+            }
+            Expression::AlignOf(_) | Expression::SizeOfTy(_) | Expression::SizeOfVal(_) => {
+                Ok(ir::Dtype::LONG)
+            }
+            Expression::Conditional(cond_expr) => {
+                // C11 6.5.15: 三元运算符的结果类型是两个分支的“公共类型”
+                let then_type = self.get_expr_dtype(&cond_expr.node.then_expression.node)?;
+                let else_type = self.get_expr_dtype(&cond_expr.node.else_expression.node)?;
+
+                if then_type == else_type {
+                    return Ok(then_type);
+                }
+
+                // 实现简化的“寻常算术转换”逻辑来决定公共类型
+                // "If both the second and third operands have arithmetic type, the result type that would be determined by the usual arithmetic conversions... is the type of the result."
+                match (&then_type, &else_type) {
+                    //浮点数，向高精度浮点看齐
+                    (ir::Dtype::Float { width: w1, .. }, ir::Dtype::Float { width: w2, .. }) => {
+                        Ok(ir::Dtype::float(std::cmp::max(*w1, *w2)))
+                    }
+                    (ir::Dtype::Float { .. }, _) => Ok(then_type),
+                    (_, ir::Dtype::Float { .. }) => Ok(else_type),
+
+                    //如果都是整数，应用整数提升规则
+                    (
+                        ir::Dtype::Int {
+                            width: w1,
+                            is_signed: s1,
+                            ..
+                        },
+                        ir::Dtype::Int {
+                            width: w2,
+                            is_signed: s2,
+                            ..
+                        },
+                    ) => {
+                        let width = std::cmp::max(*w1, *w2);
+                        let is_signed = if w1 != w2 {
+                            if w1 > w2 { *s1 } else { *s2 }
+                        } else {
+                            *s1 && *s2
+                        };
+                        Ok(ir::Dtype::int(width).set_signed(is_signed))
+                    }
+                    //指针、Void 或结构体（both void/ both same structs/ both pointers to qualified or unqualified versions of compatible types, 取限定符的并集..）
+                    _ => Ok(then_type),
+                }
+            }
+            _ => todo!(),
+        }
+    }
     fn translate_expr_lvalue(
         &mut self,
         expr: &Expression,
@@ -1261,15 +1492,19 @@ impl IrgenFunc<'_> {
             },
             Expression::StringLiteral(_string_lit) => todo!(),
             Expression::Member(member) => {
-                // 如果 a.b 是一个 int[10]，它返回 (int[10])*
-                // 如果 a.b 是一个函数，它返回 (function_type)* 不需要特殊处理
-                let (field_ptr, _field_dtype) = self.translate_member_expr_lvalue(
-                    &member.node.operator.node,
-                    &member.node.expression.node,
-                    &member.node.identifier.node,
+                let base_ptr = match member.node.operator.node {
+                    MemberOperator::Direct => {
+                        self.translate_expr_lvalue(&member.node.expression.node, context)?
+                    }
+                    MemberOperator::Indirect => {
+                        self.translate_expr_rvalue(&member.node.expression.node, context)?
+                    }
+                };
+                let (field_ptr, _) = self.get_struct_field_ptr(
+                    base_ptr,
+                    &member.node.identifier.node.name,
                     context,
                 )?;
-
                 Ok(field_ptr)
             }
             Expression::Conditional(_)
@@ -1469,6 +1704,8 @@ impl IrgenFunc<'_> {
         Ok(ptr_register) // 返回指代该variable的register
     }
 
+    // debug: ir::interp.rs的解释器中不允许执行%b0:i1:i32*const = typecast %l0:i32* to i32*const
+    // 所以在比较类型是否相同时忽略 const 属性
     fn translate_typecast(
         &mut self,
         value: ir::Operand,
@@ -1476,7 +1713,7 @@ impl IrgenFunc<'_> {
         context: &mut Context,
     ) -> Result<ir::Operand, IrgenErrorMessage> {
         // 类型一致，直接返回原始操作数
-        if value.dtype() == dtype {
+        if value.dtype().set_const(false) == dtype.clone().set_const(false) {
             return Ok(value);
         }
         // 如果操作数是一个常量，尝试进行Constant Folding，减少运行时指令开销
@@ -1494,6 +1731,7 @@ impl IrgenFunc<'_> {
         &mut self,
         stmt: &Statement,
         bid_end: ir::BlockId,
+        bid_continue: Option<ir::BlockId>,
     ) -> Result<(Vec<(ir::Constant, JumpArg)>, ir::BlockId), IrgenError> {
         // switch的翻译局限于如下形式
         // switch (e) {
@@ -1521,6 +1759,7 @@ impl IrgenFunc<'_> {
                         &mut cases,
                         &mut default,
                         bid_end,
+                        bid_continue,
                     )?;
                 }
                 _ => panic!(
@@ -1539,6 +1778,7 @@ impl IrgenFunc<'_> {
         cases: &mut Vec<(ir::Constant, JumpArg)>,
         default: &mut Option<ir::BlockId>,
         bid_end: ir::BlockId,
+        bid_continue: Option<ir::BlockId>,
     ) -> Result<(), IrgenError> {
         let label_stmt = if let Statement::Labeled(label_stmt) = stmt {
             &label_stmt.node
@@ -1586,7 +1826,7 @@ impl IrgenFunc<'_> {
                     .translate_declaration(&decl.node, &mut context)
                     .map_err(|e| IrgenError::new(decl.write_string(), e))?,
                 BlockItem::Statement(stmt) => {
-                    self.translate_stmt(&stmt.node, &mut context, None, None)?;
+                    self.translate_stmt(&stmt.node, &mut context, bid_continue, None)?;
                 }
                 BlockItem::StaticAssert(_) => {
                     panic!("BlockItem::StaticAssert not supported");
@@ -1685,7 +1925,8 @@ impl IrgenFunc<'_> {
         // 在函数栈上分配临时空间用来存放三元运算的结果
         let tmp_name = self.alloc_tempid();
         let tmp_reg = self.insert_alloc(Named::new(Some(tmp_name), res_dtype.clone()));
-        let tmp_ptr = ir::Operand::register(tmp_reg, res_dtype.clone());
+        // debug: 这里将操作数改为了pointer类型
+        let tmp_ptr = ir::Operand::register(tmp_reg, ir::Dtype::pointer(res_dtype.clone()));
         // 将 Then 的结果存入临时空间
         let _unused = context.insert_instruction(ir::Instruction::Store {
             ptr: tmp_ptr.clone(),
@@ -1744,11 +1985,13 @@ impl IrgenFunc<'_> {
         for (i, arg_ast) in call.arguments.iter().enumerate() {
             // 计算参数表达式的右值
             let arg_op = self.translate_expr_rvalue(&arg_ast.node, context)?;
-            // 隐式转换参数为函数原型对应的参数类型, 超出原型定义的参数简化处理
+            // 隐式转换参数为函数原型对应的参数类型, 超出原型定义的参数进行promotion
             let arg_casted = if let Some(target_dtype) = param_dtypes.get(i) {
                 self.translate_typecast(arg_op, target_dtype.clone(), context)?
             } else {
-                arg_op
+                // 可变参数（无原型定义）时，使用整型/浮点提升
+                self.translate_integer_promote(arg_op, context)?
+                // todo: 添加float promotion here
             };
             args.push(arg_casted);
         }
@@ -1786,18 +2029,32 @@ impl IrgenFunc<'_> {
                 // 从该地址读取数据
                 context.insert_instruction(ir::Instruction::Load { ptr })
             }
-            // 基础一元算术运算(+ - !)
-            UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::Negate => {
+            // 基础一元算术运算(+ -)
+            // debug: add `integer promotion` in Some unaryOperator  expression
+            UnaryOperator::Plus | UnaryOperator::Minus => {
                 let operand = self.translate_expr_rvalue(operand_ast, context)?;
+                let operand = self.translate_integer_promote(operand, context)?;
+
                 context.insert_instruction(ir::Instruction::UnaryOp {
                     op: op.clone(),
                     operand: operand.clone(),
                     dtype: operand.dtype(),
                 })
             }
+            UnaryOperator::Negate => {
+                let operand = self.translate_expr_rvalue(operand_ast, context)?;
+                let operand = self.translate_typecast(operand, ir::Dtype::BOOL, context)?;
+
+                context.insert_instruction(ir::Instruction::UnaryOp {
+                    op: op.clone(),
+                    operand,
+                    dtype: ir::Dtype::BOOL,
+                })
+            }
             // 按位取反 (~) 根据IR例子可得通过使用 XOR -1 来实现
             UnaryOperator::Complement => {
                 let operand = self.translate_expr_rvalue(operand_ast, context)?;
+                let operand = self.translate_integer_promote(operand, context)?;
                 let dtype = operand.dtype();
                 let mask = ir::Operand::constant(ir::Constant::int(u128::MAX, dtype.clone()));
                 context.insert_instruction(ir::Instruction::BinOp {
@@ -1808,6 +2065,8 @@ impl IrgenFunc<'_> {
                 })
             }
             // 自增与自减 (++, --) 包括前置和后置
+            // 这里不使用integer promotion，见unary.ir
+            // 注意考虑int *p; p++; 指针也能自增
             UnaryOperator::PreIncrement
             | UnaryOperator::PreDecrement
             | UnaryOperator::PostIncrement
@@ -1819,40 +2078,62 @@ impl IrgenFunc<'_> {
                 // Load 当前值
                 let old_val =
                     context.insert_instruction(ir::Instruction::Load { ptr: ptr.clone() })?;
-                //计算新值 val+1 or val-1
+
                 let is_inc = matches!(
                     op,
                     UnaryOperator::PreIncrement | UnaryOperator::PostIncrement
                 );
-                let bin_op = if is_inc {
-                    BinaryOperator::Plus
+                let is_post = matches!(
+                    op,
+                    UnaryOperator::PostIncrement | UnaryOperator::PostDecrement
+                );
+
+                let new_val = if let Some(inner_type) = dtype.get_pointer_inner() {
+                    // A. 指针自增/自减
+                    let (size, _) = inner_type
+                        .size_align_of(self.structs)
+                        .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
+                    let mut stride = size as i128;
+                    if !is_inc {
+                        stride = -stride;
+                    }
+
+                    let offset =
+                        ir::Operand::constant(ir::Constant::int(stride as u128, ir::Dtype::LONG));
+                    // 使用 GetElementPtr 计算新地址
+                    context.insert_instruction(ir::Instruction::GetElementPtr {
+                        ptr: old_val.clone(),
+                        offset,
+                        dtype: dtype.clone(), // 结果依然是同类型的指针
+                    })?
                 } else {
-                    BinaryOperator::Minus
+                    // B. 整数或浮点数自增
+                    let bin_op = if is_inc {
+                        BinaryOperator::Plus
+                    } else {
+                        BinaryOperator::Minus
+                    };
+                    // 只有这里才能调用 Constant::int，因为此时 dtype 确定是标量
+                    let one = if dtype.get_float_width().is_some() {
+                        ir::Operand::constant(ir::Constant::float(1.0, dtype.clone()))
+                    } else {
+                        ir::Operand::constant(ir::Constant::int(1, dtype.clone()))
+                    };
+                    context.insert_instruction(ir::Instruction::BinOp {
+                        op: bin_op,
+                        lhs: old_val.clone(),
+                        rhs: one,
+                        dtype: dtype.clone(),
+                    })?
                 };
-                let one = ir::Operand::constant(ir::Constant::int(1, dtype.clone()));
-
-                let new_val = context.insert_instruction(ir::Instruction::BinOp {
-                    op: bin_op,
-                    lhs: old_val.clone(),
-                    rhs: one,
-                    dtype: dtype.clone(),
-                })?;
-
                 // 将新值存回去
                 let _unused = context.insert_instruction(ir::Instruction::Store {
-                    ptr: ptr.clone(),
+                    ptr,
                     value: new_val.clone(),
                 })?;
 
                 // 根据++,--是后缀还是前缀决定返回旧值operand还是新值
-                if matches!(
-                    op,
-                    UnaryOperator::PreDecrement | UnaryOperator::PreIncrement
-                ) {
-                    Ok(new_val)
-                } else {
-                    Ok(old_val)
-                }
+                Ok(if is_post { old_val } else { new_val })
             }
         }
     }
@@ -1868,8 +2149,17 @@ impl IrgenFunc<'_> {
             // a[i] equiv to *(a + i),使用GetElementPtr指令
             BinaryOperator::Index => {
                 let element_ptr = self.translate_index_op_lvalue(lhs_ast, rhs_ast, context)?;
-                // 作为右值，需要Load
-                context.insert_instruction(ir::Instruction::Load { ptr: element_ptr })
+
+                // debug: hard: a[i]作为右值 需要考虑Array/Function Decay
+                let element_dtype = element_ptr.dtype().get_pointer_inner().unwrap().clone();
+                let rvalue = if let Some(inner) = element_dtype.get_array_inner() {
+                    self.convert_array_to_pointer(element_ptr, inner.clone(), context)?
+                } else if element_dtype.get_function_inner().is_some() {
+                    element_ptr
+                } else {
+                    context.insert_instruction(ir::Instruction::Load { ptr: element_ptr })?
+                };
+                Ok(rvalue)
             }
             // 普通算术和比较运算
             BinaryOperator::Multiply
@@ -1888,9 +2178,16 @@ impl IrgenFunc<'_> {
             | BinaryOperator::BitwiseAnd
             | BinaryOperator::BitwiseXor
             | BinaryOperator::BitwiseOr => {
+                // debug: 这里不能直接将rhs转换成lhs的dtype，例如: 0:i32 < 0xFFFFFFFF:u32, 如果强转，就会变成 0:i32 < -1:i32 -> false
+                // 在interp.rs中：calculate_binary_operator_expression要求两个类型宽度和符号都一致，如果是指针则只要求指向的bid和offset一样
+                // debug: integral promotion. 例子见shift.ir
                 let lhs = self.translate_expr_rvalue(lhs_ast, context)?;
                 let rhs = self.translate_expr_rvalue(rhs_ast, context)?;
-                let rhs = self.translate_typecast(rhs, lhs.dtype(), context)?;
+
+                let common_dtype = self.get_common_type(lhs.dtype(), rhs.dtype());
+                let lhs = self.translate_typecast(lhs, common_dtype.clone(), context)?;
+                let rhs = self.translate_typecast(rhs, common_dtype.clone(), context)?;
+
                 // 确定结果类型，如果是比较运算，返回i1(BOOL)
                 let res_dtype = if matches!(
                     op,
@@ -1903,7 +2200,7 @@ impl IrgenFunc<'_> {
                 ) {
                     ir::Dtype::BOOL
                 } else {
-                    lhs.dtype()
+                    common_dtype // interp.rs中指针之间只允许Equals/NotEquals比较, 不会到这个分支
                 };
 
                 context.insert_instruction(ir::Instruction::BinOp {
@@ -1984,6 +2281,65 @@ impl IrgenFunc<'_> {
         }
     }
 
+    // 寻常算术转换（类型平衡)(与整型提升不同)
+    fn get_common_type(&self, t1: ir::Dtype, t2: ir::Dtype) -> ir::Dtype {
+        // 1. 先进行整型提升
+        let t1 = self.integer_promote_type(t1);
+        let t2 = self.integer_promote_type(t2);
+
+        if t1 == t2 {
+            return t1;
+        }
+
+        // 2. 寻常算术转换平衡
+        match (&t1, &t2) {
+            (ir::Dtype::Float { width: w1, .. }, ir::Dtype::Float { width: w2, .. }) => {
+                ir::Dtype::float(std::cmp::max(*w1, *w2))
+            }
+            (ir::Dtype::Float { .. }, _) => t1,
+            (_, ir::Dtype::Float { .. }) => t2,
+            (
+                ir::Dtype::Int {
+                    width: w1,
+                    is_signed: s1,
+                    ..
+                },
+                ir::Dtype::Int {
+                    width: w2,
+                    is_signed: s2,
+                    ..
+                },
+            ) => {
+                let width = std::cmp::max(*w1, *w2);
+                let is_signed = if w1 != w2 {
+                    if w1 > w2 { *s1 } else { *s2 }
+                } else {
+                    *s1 && *s2
+                };
+                ir::Dtype::int(width).set_signed(is_signed)
+            }
+            _ => t1, // todo: 可能是pointer和struct
+        }
+    }
+
+    fn integer_promote_type(&self, dtype: ir::Dtype) -> ir::Dtype {
+        match &dtype {
+            ir::Dtype::Int { width, .. } => {
+                // todo: 考虑提升为u32的情况
+                if *width >= 32 { dtype } else { ir::Dtype::INT }
+            }
+            _ => dtype,
+        }
+    }
+
+    fn translate_integer_promote(
+        &mut self,
+        operand: ir::Operand,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenErrorMessage> {
+        let target_type = self.integer_promote_type(operand.dtype());
+        self.translate_typecast(operand, target_type, context)
+    }
     // translate a[i] as lvalue
     fn translate_index_op_lvalue(
         &mut self,
@@ -2002,11 +2358,13 @@ impl IrgenFunc<'_> {
             })?
             .clone();
         let (size, _) = inner_type
-            .size_align_of(&self.structs)
+            .size_align_of(self.structs)
             .map_err(|e| IrgenErrorMessage::InvalidDtype { dtype_error: e })?;
         let size = ir::Operand::constant(ir::Constant::int(size as u128, ir::Dtype::LONG));
 
         // 计算byte 偏移量
+        // debug: 二元运算时要求lhs与rhs位宽一致
+        let index = self.translate_typecast(index, ir::Dtype::LONG, context)?;
         let offset = context.insert_instruction(ir::Instruction::BinOp {
             op: BinaryOperator::Multiply,
             lhs: index,
@@ -2082,24 +2440,12 @@ impl IrgenFunc<'_> {
         context.insert_instruction(ir::Instruction::Load { ptr: result_ptr })
     }
 
-    fn translate_member_expr_lvalue(
-        &mut self,
-        op: &MemberOperator,
-        expr: &Expression,
-        member: &Identifier,
+    fn get_struct_field_ptr(
+        &self,
+        base_ptr: ir::Operand,
+        field_name: &str,
         context: &mut Context,
     ) -> Result<(ir::Operand, ir::Dtype), IrgenErrorMessage> {
-        let base_ptr = match op {
-            MemberOperator::Direct => {
-                // a.b -> 先获取a的左值(地址)
-                self.translate_expr_lvalue(expr, context)?
-            }
-            MemberOperator::Indirect => {
-                // a->b -> 先获取a的右值(隐含a是个指针)
-                self.translate_expr_rvalue(expr, context)?
-            }
-        };
-
         let base_dtype = base_ptr.dtype();
         let struct_dtype =
             base_dtype
@@ -2107,11 +2453,11 @@ impl IrgenFunc<'_> {
                 .ok_or_else(|| IrgenErrorMessage::Misc {
                     message: "member access on non-pointer type".to_string(),
                 })?;
+
         // 在结构体定义中查找字段的偏移量和类型
         // 这里利用Dtype方法get_offset_struct_field
-        let field_name = &member.name;
         let (offset, field_dtype) = struct_dtype
-            .get_offset_struct_field(field_name, &self.structs)
+            .get_offset_struct_field(field_name, self.structs)
             .ok_or_else(|| IrgenErrorMessage::Misc {
                 message: format!("field {} not found in struct", field_name),
             })?;

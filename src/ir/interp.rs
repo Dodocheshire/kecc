@@ -891,6 +891,8 @@ impl Byte {
                     .map(Byte::get_concrete)
                     .collect::<Option<Vec<_>>>()
                 else {
+                    // 如果 bytes 序列中包含 Byte::Undef，map(Byte::get_concrete) 会返回 None
+                    // 导致 collect 失败，最终进入这里
                     return Ok(Value::undef(dtype.clone()));
                 };
                 let value = Self::bytes_to_u128(&value, *is_signed);
@@ -1364,6 +1366,7 @@ impl<'i> State<'i> {
                 arg_else,
             } => {
                 let value = self.interp_operand(condition)?;
+                // 如果操作数指向的内存包含Undef(即变量未初始化)，那么此时 value 是 Value::Undef
                 let (value, width, _) = value.get_int().expect("`condition` must be `Value::Int`");
                 // Check if it is boolean
                 assert!(width == 1);
