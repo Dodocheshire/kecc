@@ -23,6 +23,35 @@ macro_rules! some_or_exit {
     }};
 }
 
+#[macro_export]
+macro_rules! ok_or {
+    // With an error binding: ok_or!(expr, |e| { ... }) or ok_or!(expr, |e| expr)
+    ($expr:expr, |$e:ident| $($on_err:tt)*) => {{
+        match $expr {
+            Ok(v) => v,
+            Err($e) => { $($on_err)* },
+        }
+    }};
+    // Without an error binding: ok_or!(expr, { ... })
+    ($expr:expr, $on_err:block) => {{
+        match $expr {
+            Ok(v) => v,
+            Err(_) => $on_err,
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! some_or {
+    // Fallback: some_or!(opt, { ... }) or some_or!(opt, expr)
+    ($expr:expr, $($fallback:tt)*) => {{
+        match $expr {
+            Some(v) => v,
+            None => { $($fallback)* },
+        }
+    }};
+}
+
 /// Translates `S` to [`Translate::Target`].
 // TODO: Should this be in utils?
 pub trait Translate<S> {
