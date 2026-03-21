@@ -135,7 +135,7 @@ impl Optimize<FunctionDefinition> for SimplifyCfgMerge {
                 }
                 // exit 替换
                 block_from.exit = block_to.exit;
-                let _ = code.walk(&mut |operand| replace_operands(operand, &replaces));
+                let _ = code.walk(|operand| replace_operands(operand, &replaces));
 
                 changed = true;
                 result = true;
