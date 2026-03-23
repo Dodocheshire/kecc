@@ -1,0 +1,44 @@
+fun unit @sink (i32) {
+init:
+  bid: b0
+  allocations:
+
+block b0:
+  %b0:p0:i32
+  ret unit:unit
+}
+
+fun i32 @single_location () {
+init:
+  bid: b666
+  allocations:
+    %l0:i32:x
+
+block b666:
+  j b0()
+
+block b0:
+  %b0:i0:i32 = load %l0:i32*
+  %b0:i1:unit = call @sink:[ret:unit params:(i32)]*(%b0:i0:i32)
+  %b0:i2:unit = store 0:i32 %l0:i32*
+  switch undef:i32 default b1() [
+    2:i32 b2()
+    3:i32 b3()
+  ]
+
+block b1:
+  %b1:i0:i32 = load %l0:i32*
+  %b1:i1:unit = call @sink:[ret:unit params:(i32)]*(%b1:i0:i32)
+  %b1:i2:unit = store 100:i32 %l0:i32*
+  j b2()
+
+block b2:
+  %b2:i0:i32 = load %l0:i32*
+  %b2:i1:unit = call @sink:[ret:unit params:(i32)]*(%b2:i0:i32)
+  %b2:i2:unit = store 200:i32 %l0:i32*
+  j b3()
+
+block b3:
+  %b3:i0:unit = store 300:i32 %l0:i32*
+  j b0()
+}

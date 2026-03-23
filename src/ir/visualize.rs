@@ -1,8 +1,11 @@
 //! Visualize IR.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
 use crate::Translate;
+use crate::ir::Parse;
 use crate::ir::*;
 
 #[derive(Default, Debug)]
@@ -223,4 +226,17 @@ impl Visualizer {
 
         Ok(format!("subgraph \"cluster.{name}.{bid}\" {{\n{inner}\n}}"))
     }
+}
+
+#[test]
+fn visualize_ir() {
+    let ir_path = Path::new("examples/mem2reg/multi-location.output.ir");
+    let mut parser = Parse::default();
+    let translation_unit = parser.translate(&ir_path).expect("failed to parse ir file");
+    let mut visualizer = Visualizer::default();
+    let dot_string = visualizer
+        .translate(&translation_unit)
+        .expect("failed to visualize IR");
+    fs::write("output.dot", dot_string).expect("unable to write file");
+    println!("DOT file generated: input.dot");
 }

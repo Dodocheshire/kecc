@@ -2,6 +2,7 @@ mod deadcode;
 mod gvn;
 mod mem2reg;
 pub(crate) mod opt_utils;
+pub(crate) mod opt_visualizer;
 mod simplify_cfg;
 
 pub use deadcode::Deadcode;

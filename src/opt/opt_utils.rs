@@ -8,6 +8,7 @@ use core::panic;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ops::DerefMut;
+use std::process::id;
 
 pub(crate) fn make_cfg(fdef: &FunctionDefinition) -> HashMap<BlockId, Vec<JumpArg>> {
     fdef.blocks
@@ -186,7 +187,7 @@ impl Walkable for JumpArg {
 #[derive(Debug, Default)]
 pub(crate) struct Domtree {
     idoms: HashMap<BlockId, BlockId>,
-    frontiers: HashMap<BlockId, Vec<BlockId>>,
+    pub(crate) frontiers: HashMap<BlockId, Vec<BlockId>>,
     reverse_post_order: Vec<BlockId>,
 }
 
@@ -204,7 +205,7 @@ impl Domtree {
             .enumerate()
             .map(|(i, bid)| (*bid, i))
             .collect();
-
+        println!("RPO: {:?}", reverse_post_order);
         // immediate dominator of each block
         let mut idoms = HashMap::<BlockId, BlockId>::new();
         // get idoms using iterative methods
@@ -289,19 +290,42 @@ impl Domtree {
             reverse_post_order,
         }
     }
+
+    pub(crate) fn idom(&self, bid: BlockId) -> Option<BlockId> {
+        self.idoms.get(&bid).cloned()
+    }
+
+    pub(crate) fn frontiers(&self, bid: BlockId) -> Option<&Vec<BlockId>> {
+        self.frontiers.get(&bid)
+    }
+
+    pub(crate) fn reverse_post_order(&self) -> Vec<BlockId> {
+        self.reverse_post_order.clone()
+    }
+
+    pub(crate) fn walk<F>(&self, mut f: F)
+    where
+        F: FnMut(Option<BlockId>, BlockId),
+    {
+        for bid in &self.reverse_post_order {
+            f(self.idoms.get(bid).cloned(), *bid);
+        }
+    }
 }
 
 impl Domtree {
     // whether lhs dominates rhs? -> lhs ?= idom^*(rhs)
     fn dominates(idoms: &HashMap<BlockId, BlockId>, lhs: BlockId, mut rhs: BlockId) -> bool {
-        loop {
+        if rhs == lhs {
+            return true;
+        }
+        while let Some(&idom) = idoms.get(&rhs) {
+            rhs = idom;
             if rhs == lhs {
                 return true;
             }
-            let Some(rhs) = idoms.get(&rhs).cloned() else {
-                return false;
-            };
         }
+        false
     }
 }
 
@@ -359,4 +383,13 @@ fn intersect_idom(
             Ordering::Equal => panic!("intersect_dom: lhs == rhs cannot happen"),
         }
     }
+}
+
+// mark a(potentially) allocation as inpromotable
+pub(crate) fn mark_inpromotable(inpromotable: &mut HashSet<usize>, value: &Operand) {
+    let (rid, _) = some_or!(value.get_register(), return);
+    let RegisterId::Local { aid } = rid else {
+        return;
+    };
+    let _unused = inpromotable.insert(*aid);
 }
