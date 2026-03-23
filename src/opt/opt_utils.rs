@@ -63,7 +63,7 @@ pub(crate) fn reverse_cfg(
 
 pub(crate) fn replace_operands(operand: &mut Operand, replaces: &HashMap<RegisterId, Operand>) {
     if let Operand::Register { rid, .. } = operand {
-        if let Some(new_operand) = replaces.get(&rid) {
+        if let Some(new_operand) = replaces.get(rid) {
             *operand = new_operand.clone();
         }
     }
@@ -205,7 +205,7 @@ impl Domtree {
             .enumerate()
             .map(|(i, bid)| (*bid, i))
             .collect();
-        println!("RPO: {:?}", reverse_post_order);
+        // println!("RPO: {:?}", reverse_post_order);
         // immediate dominator of each block
         let mut idoms = HashMap::<BlockId, BlockId>::new();
         // get idoms using iterative methods
@@ -227,7 +227,7 @@ impl Domtree {
                 // 在更新bid的idom值时，要利用self.idoms中存储的各个bid_prev的idom值，这也是为什么我们需要从RPO值较小的节点开始更新idom
                 for (bid_prev, _) in reverse_cfg.get(bid).unwrap() {
                     // 前驱节点的idom值计算过(这个判断是否有必要吗?)
-                    if *bid_prev == bid_init || idoms.get(bid_prev).is_some() {
+                    if *bid_prev == bid_init || idoms.contains_key(bid_prev) {
                         idom = Some(intersect_idom(
                             idom,
                             *bid_prev,
@@ -259,6 +259,7 @@ impl Domtree {
 
         // 计算dominance frontier
         // DF(X) = {Y | X \notin dom(Y) /\ (exists Z \in pred(Y) s.t. X = {Z} U dom(Z))}
+        // 注意dominate关系是在两个不同的block之间才有，不能说X \in dom(X), 但是如果X \in prev(X)且X不只1个prev，那么X \in DF(X)
         let mut frontiers = HashMap::new();
         for (bid, prevs) in reverse_cfg {
             // 如果唯一的predecessor被X dominate，那自己也一定被X dominate，所以自己一定不是dominance frontier
@@ -274,11 +275,10 @@ impl Domtree {
                 // runner = Z -> idom(Z) -> idom(idom(Z)) -> ...(runner iterates over Z U {dom(Z)})
                 let mut runner = *bid_prev;
                 // 当runner 能dominate Y时停止往dominance tree上级遍历
-                // 首先能进入循环，因为Y有多个predecessor，Z不会dominate Y
-                while !Self::dominates(&idoms, runner, *bid) {
+                while runner == *bid || !Self::dominates(&idoms, runner, *bid) {
                     // 此时的(X, Y)构成一组frontier有序对(X has a dominance frontier called Y)
                     frontiers.entry(runner).or_insert_with(Vec::new).push(*bid);
-                    println!("runner: {}, bid: {}, idom: {}", runner, bid, idom); // 打印X, Y, 和Y实际的immediate dominator(X应该不断向上靠近idom(Y),但是不会dominate Y)
+                    // println!("runner: {}, bid: {}, idom: {}", runner, bid, idom); // 打印X, Y, 和Y实际的immediate dominator(X应该不断向上靠近idom(Y),但是不会dominate Y)
                     runner = *idoms.get(&runner).unwrap(); // 不用担心是bid_init,因为runner = bid_init时一定退出循环了
                 }
             }
@@ -317,7 +317,7 @@ impl Domtree {
     // whether lhs dominates rhs? -> lhs ?= idom^*(rhs)
     fn dominates(idoms: &HashMap<BlockId, BlockId>, lhs: BlockId, mut rhs: BlockId) -> bool {
         if rhs == lhs {
-            return true;
+            panic!("dominance relation can only be judge when lhs != rhs");
         }
         while let Some(&idom) = idoms.get(&rhs) {
             rhs = idom;

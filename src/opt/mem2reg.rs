@@ -28,19 +28,18 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                 match instr.deref() {
                     Instruction::Nop => {}
                     Instruction::BinOp { lhs, rhs, .. } => {
-                        mark_inpromotable(&mut inpromotable, &lhs);
-                        mark_inpromotable(&mut inpromotable, &rhs);
+                        mark_inpromotable(&mut inpromotable, lhs);
+                        mark_inpromotable(&mut inpromotable, rhs);
                     }
                     Instruction::UnaryOp { operand, .. } => {
-                        mark_inpromotable(&mut inpromotable, &operand);
+                        mark_inpromotable(&mut inpromotable, operand);
                     }
                     Instruction::Store { ptr, value } => {
-                        mark_inpromotable(&mut inpromotable, &value);
+                        mark_inpromotable(&mut inpromotable, value);
                         let (rid, _) = some_or!(ptr.get_register(), continue);
                         if let RegisterId::Local { aid } = rid {
                             // 注意stores里的一个allocation可能记录多个相同的bid
-                            let _unused =
-                                stores.entry(*aid).or_insert_with(HashSet::new).insert(*bid);
+                            let _unused = stores.entry(*aid).or_default().insert(*bid);
                         }
                     }
                     Instruction::Load { .. } => {}
@@ -61,18 +60,21 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                         mark_inpromotable(&mut inpromotable, offset);
                     }
                     Instruction::TypeCast { value, .. } => {
-                        mark_inpromotable(&mut inpromotable, &value);
+                        mark_inpromotable(&mut inpromotable, value);
                     }
                 }
             }
         }
         // if no local allocations are promotable, bail out
-        if (0..code.allocations.len()).all(|i| inpromotable.contains(&i)) {
+        let promotables = (0..code.allocations.len())
+            .filter(|i| !inpromotable.contains(i))
+            .collect::<Vec<_>>();
+        if promotables.is_empty() {
             return false;
         }
 
-        println!("stores: {:?}", stores);
-        println!("inpromotable: {:?}", inpromotable);
+        // println!("stores: {:?}", stores);
+        // println!("promotables: {:?}", promotables);
 
         // draws CFG, reverse CFG, and dominator tree(Domtree)
         let cfg = make_cfg(code);
@@ -94,7 +96,7 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
         // Given allocation `aid` and all blocks `bid` that stores to `aid`, calculate DF(bids) U DF(DF(bids)) U ...
         let joins: HashMap<usize, HashSet<BlockId>> = stores
             .iter()
-            .filter(|(aid, bids)| !inpromotable.contains(*aid))
+            .filter(|(aid, bids)| promotables.contains(*aid))
             .map(|(aid, bids)| {
                 (*aid, {
                     // DFS search start
@@ -115,7 +117,7 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             })
             .collect();
 
-        println!("joins: {:?}", joins);
+        // println!("joins: {:?}", joins);
 
         // table for the nearest join block according to the dominator tree
         let mut join_table = JoinTable::new(&domtree, &joins);
@@ -123,16 +125,20 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
         // replacement dictionary
         let mut replaces = HashMap::<RegisterId, OperandVar>::new();
 
-        // Phinodes to be inserted. If `(aid, bid)` is in this set, then a phinode for `aid` should
-        // be inserted at the beginning of `bid` 即记录哪些块确实需要插入Phi节点
+        // 信任并使用完整的 joins 集合来生成初始的 Phi 列表，而不是靠 Load 指令动态添加
         let mut phinode_indexes = HashSet::<(usize, BlockId)>::new();
+        for (&aid, block_set) in &joins {
+            for &bid in block_set {
+                let _unused = phinode_indexes.insert((aid, bid));
+            }
+        }
 
         // values stored in local allcations at the end of each block. If `(aid, bid) |-> X`,
         // then the value stored in `aid`  at the end of `bid` is  `X`
         // 初始化每个变量的值为undef
-        let mut end_values: HashMap<(usize, BlockId), OperandVar> = (0..code.allocations.len())
-            .filter(|i| !inpromotable.contains(i))
-            .map(|aid| {
+        let mut end_values: HashMap<(usize, BlockId), OperandVar> = promotables
+            .iter()
+            .map(|&aid| {
                 let dtype = code.allocations.get(aid).unwrap().deref().clone();
                 (
                     (aid, code.bid_init),
@@ -142,10 +148,27 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             .collect();
 
         // iterate in RPO order to calculate `end_values` and `replaces`
+        // 原因：在 RPO（逆后序）遍历中，除了循环的回跳边，总会在访问一个节点之前访问它的所有支配者。在处理bid时，idom(bid)的end_values一定计算完了
         let rpo = domtree.reverse_post_order();
 
-        for bid in &rpo {
-            let block = code.blocks.get(bid).unwrap();
+        for &bid in &rpo {
+            // 在处理每个块的指令之前，先根据支配关系初始化块变量的入口值 (继承或设为 Phi)
+            for &aid in &promotables {
+                if phinode_indexes.contains(&(aid, bid)) {
+                    // 如果是 Join 节点，该变量在此处的入口值就是一个待定的 Phi
+                    let _unused = end_values.insert((aid, bid), OperandVar::Phi((aid, bid)));
+                } else {
+                    // 否则，从直接支配者 (idom) 继承结束值
+                    if let Some(parent_bid) = domtree.idom(bid) {
+                        if let Some(inherited_val) = end_values.get(&(aid, parent_bid)).cloned() {
+                            let _unused = end_values.insert((aid, bid), inherited_val);
+                        }
+                    }
+                    // 注意：如果是 bid_init ，它已经在初始化时拥有了 Undef 值
+                }
+            }
+
+            let block = code.blocks.get(&bid).unwrap();
 
             for (i, instr) in block.instructions.iter().enumerate() {
                 match instr.deref() {
@@ -156,8 +179,16 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                             if inpromotable.contains(aid) {
                                 continue;
                             }
-                            let _unused =
-                                end_values.insert((*aid, *bid), OperandVar::Operand(value.clone()));
+                            // Store 会覆盖之前的继承值或 Phi 值
+                            // !不要直接存 value，要看这个 value 是不是也被别的OperandVar替换了
+                            let mut actual_val = OperandVar::Operand(value.clone());
+                            if let Some((v_rid, _)) = value.get_register() {
+                                if let Some(replaced_var) = replaces.get(v_rid) {
+                                    actual_val = replaced_var.clone();
+                                }
+                            }
+
+                            let _unused = end_values.insert((*aid, bid), actual_val);
                         }
                     }
                     Instruction::Load { ptr } => {
@@ -166,35 +197,14 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                             if inpromotable.contains(aid) {
                                 continue;
                             }
-                            let bid_join = join_table.lookup(*aid, *bid);
-                            println!(
-                                "in block {}, inst {}, the load instruction has bid_join: {}",
-                                bid, i, bid_join
-                            );
-                            let mut runner = *bid;
-                            // runner: bid -> idom(bid) -> idom(idom(bid)) -> ... -> bid_join
-                            while runner != bid_join && !end_values.contains_key(&(*aid, runner)) {
-                                runner = domtree.idom(runner).expect(
-                                    "runner should have idom because it cannot be bid_init",
-                                );
-                            }
+                            // Load 变得极其简单：直接拿当前块此变量的最新值
+                            let current_val = end_values
+                                .get(&(*aid, bid))
+                                .expect("Value must have been initialized or inherited")
+                                .clone();
 
-                            let var = end_values.entry((*aid, runner)).or_insert_with(|| {
-                                // 此时说明bid_join没有store %aid的指令(且根据RPO的块访问顺序, runner路径上的block也没有对#aid进行store)，需要申请phinode延长变量#aid的lifetime
-                                assert_eq!(runner, bid_join);
-                                let _unused = phinode_indexes.insert((*aid, bid_join));
-                                OperandVar::Phi((*aid, bid_join))
-                            });
-                            println!(
-                                "in block {}, inst {}, the load result is replaced with: {}",
-                                bid, i, var
-                            );
-
-                            let result = replaces.insert(RegisterId::temp(*bid, i), var.clone());
+                            let result = replaces.insert(RegisterId::temp(bid, i), current_val);
                             assert_eq!(result, None);
-                            // 同步更新当前块结束时的最新值
-                            let var = var.clone();
-                            let _unused = end_values.insert((*aid, *bid), var);
                         }
                     }
                     _ => {}
@@ -202,67 +212,42 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
             }
         }
 
-        println!(
-            "the initial phinodes that should be inserted `phinode_indexes`: {:?}",
-            phinode_indexes
-        );
+        // println!("phinodes that will be inserted : {:?}", phinode_indexes);
 
-        // generate phinodes recursively
-        println!("generating phinodes recursively...");
-
-        let mut phinode_visited = phinode_indexes;
-        let mut phinode_stack = phinode_visited.iter().cloned().collect::<Vec<_>>();
+        // 在 RPO 遍历完成后, end_values已经是一个完整的值流表。对任何一个块bid_prev, end_values[(aid, bid_prev)]已经准确记录了变量在块bid_prev结束时的“最终面貌”
+        // phinode_indexes 已经预先根据 joins 集合填满了所有需要插入 Phi 的 (aid, bid)
         let mut phinodes =
             BTreeMap::<(usize, BlockId), (Dtype, HashMap<BlockId, OperandVar>)>::new();
-        println!("`initial phinode_stack` {:?}", phinode_stack);
-        while let Some((aid, bid)) = phinode_stack.pop() {
+
+        for &(aid, bid) in &phinode_indexes {
             let mut cases = HashMap::new();
-            // 一个phinode依赖多个predecessor的end value，可能要求新的phinode
-            let prevs = some_or!(reverse_cfg.get(&bid), continue);
-            for (bid_prev, _) in prevs {
-                let bid_prev_join = join_table.lookup(aid, *bid_prev);
 
-                println!(
-                    "bid_prev: {}, bid: {}, bid_prev_join of aid#{} is {}",
-                    bid_prev, bid, aid, bid_prev_join
-                );
+            // 获取当前 Join 点的所有前驱
+            if let Some(preds) = reverse_cfg.get(&bid) {
+                for (bid_prev, _) in preds {
+                    // 直接从 end_values 取值
+                    let var = end_values
+                        .get(&(aid, *bid_prev))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            // 理论上 RPO 遍历后不会走到这里
+                            let dtype = code.allocations.get(aid).unwrap().deref().clone();
+                            OperandVar::Operand(Operand::constant(Constant::Undef { dtype }))
+                        });
 
-                let mut runner = *bid_prev;
-                // runner: bid_prev -> idom(bid_prev) -> idom(idom(bid_prev)) -> ... -> bid_prev_join
-                while runner != bid_prev_join && !end_values.contains_key(&(aid, runner)) {
-                    runner = domtree
-                        .idom(runner)
-                        .expect("runner should have idom because it cannot be bid_init");
+                    let _unused = cases.insert(*bid_prev, var);
                 }
-                let var = end_values.entry((aid, runner)).or_insert_with(|| {
-                    assert_eq!(runner, bid_prev_join);
-                    if phinode_visited.insert((aid, bid_prev_join)) {
-                        phinode_stack.push((aid, bid_prev_join));
-                    }
-                    OperandVar::Phi((aid, bid_prev_join))
-                });
-
-                println!(
-                    "In bid_prev {}, phinode argument for aid#{} passed is {}",
-                    bid_prev, aid, var
-                );
-
-                // phi(x1, x2, ..., x_n) bid有predecessor，传递参数为x_i(即下式的`var`)
-                let _unused = cases.insert(*bid_prev, var.clone());
             }
-            let _unused = phinodes.insert(
-                (aid, bid),
-                (code.allocations.get(aid).unwrap().deref().clone(), cases),
-            );
-        }
 
-        println!("finally, these phinodes will be inserted: {:?}", phinodes);
+            let dtype = code.allocations.get(aid).unwrap().deref().clone();
+            let _unused = phinodes.insert((aid, bid), (dtype, cases));
+        }
 
         // the phinode indexes for promoted allocations in each block
         // phinode_indexes[(aid, bid)] = p -> bid块中为变量aid分配的phinode在第p个位置
         let mut phinode_indexes = HashMap::<(usize, BlockId), usize>::new();
         // insert phinodes
-        println!("inserting phinodes...");
+        // println!("inserting phinodes...");
         for ((aid, bid), (dtype, _)) in &phinodes {
             let block = code.blocks.get_mut(bid).unwrap();
             let index = block.phinodes.len();
@@ -282,7 +267,7 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                 block_prev.exit.walk_jump_args(|jump_arg| {
                     if &jump_arg.bid == bid {
                         // 假如有3个predecessors要给phinode %bid:%index传参，要求此时这predecessor的blockexit中下一跳为bid的jumparg.args长度恰好为index
-                        assert_eq!(jump_arg.args.len(), index);
+                        assert_eq!(jump_arg.args.len(), index); // phinode_arg在jump_arg参数列表中的位置 = phinode在bid中phinodes的位置
                         jump_arg.args.push(phinode_arg.clone());
                     }
                 });
@@ -303,7 +288,7 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                     Instruction::Store { ptr, value } => {
                         let (rid, _) = some_or!(ptr.get_register(), continue);
                         if let RegisterId::Local { aid } = rid {
-                            if !inpromotable.contains(aid) {
+                            if promotables.contains(aid) {
                                 *inst.deref_mut() = Instruction::Nop;
                             }
                         }
@@ -311,7 +296,7 @@ impl Optimize<FunctionDefinition> for Mem2regInner {
                     Instruction::Load { ptr } => {
                         let (rid, _) = some_or!(ptr.get_register(), continue);
                         if let RegisterId::Local { aid } = rid {
-                            if !inpromotable.contains(aid) {
+                            if promotables.contains(aid) {
                                 *inst.deref_mut() = Instruction::Nop;
                             }
                         }
@@ -352,7 +337,7 @@ impl<'s> JoinTable<'s> {
             // bid 沿着domtree向上遍历时记录沿途的节点到bids中
             bids.push(bid);
             // 如果当前bid节点为`join`节点
-            if self.joins.get(&aid).map_or(false, |v| v.contains(&bid)) {
+            if self.joins.get(&aid).is_some_and(|v| v.contains(&bid)) {
                 break bid;
             }
             bid = some_or!(self.domtree.idom(bid), break bid); // 到bid_init退出循环

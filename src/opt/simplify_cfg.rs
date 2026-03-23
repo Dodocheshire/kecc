@@ -36,17 +36,14 @@ pub struct SimplifyCfgEmpty {}
 
 impl Optimize<FunctionDefinition> for SimplifyCfgConstProp {
     fn optimize(&mut self, code: &mut FunctionDefinition) -> bool {
-        code.blocks
-            .iter_mut()
-            .map(|(_, block)| {
-                if let Some(exit) = self.simplify_block_exit(&block.exit) {
-                    block.exit = exit;
-                    true
-                } else {
-                    false
-                }
-            })
-            .fold(false, |l, r| l || r)
+        code.blocks.iter_mut().any(|(_, block)| {
+            if let Some(exit) = self.simplify_block_exit(&block.exit) {
+                block.exit = exit;
+                true
+            } else {
+                false
+            }
+        })
     }
 }
 
@@ -88,7 +85,7 @@ impl Optimize<FunctionDefinition> for SimplifyCfgMerge {
             let pred = reverse_cfg(&graph);
 
             let mut changed = false;
-            let keys: Vec<_> = code.blocks.keys().map(|k| *k).collect();
+            let keys: Vec<_> = code.blocks.keys().copied().collect();
 
             for bid_from in keys {
                 // 注意循环中会减少code.blocks中的block个数，但keys不变，所以code.blocks.get(&bid_from)不一定为Some
@@ -135,7 +132,7 @@ impl Optimize<FunctionDefinition> for SimplifyCfgMerge {
                 }
                 // exit 替换
                 block_from.exit = block_to.exit;
-                let _ = code.walk(|operand| replace_operands(operand, &replaces));
+                code.walk(|operand| replace_operands(operand, &replaces));
 
                 changed = true;
                 result = true;
@@ -159,8 +156,7 @@ impl Optimize<FunctionDefinition> for SimplifyCfgEmpty {
             .collect::<HashMap<_, _>>();
         code.blocks
             .iter_mut()
-            .map(|(_, block)| self.simplify_block_exit(&mut block.exit, &empty_blocks))
-            .fold(false, |l, r| l || r)
+            .any(|(_, block)| self.simplify_block_exit(&mut block.exit, &empty_blocks))
     }
 }
 
@@ -248,8 +244,7 @@ impl SimplifyCfgEmpty {
                 let changed1 = self.simplify_jump_arg(default, empty_blocks);
                 let changed2 = cases
                     .iter_mut()
-                    .map(|(_, arg)| self.simplify_jump_arg(arg, empty_blocks))
-                    .fold(false, |l, r| l || r);
+                    .any(|(_, arg)| self.simplify_jump_arg(arg, empty_blocks));
                 changed1 || changed2
             }
             BlockExit::Return { .. } | BlockExit::Unreachable => false,
